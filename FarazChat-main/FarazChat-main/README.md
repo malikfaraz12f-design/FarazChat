@@ -21,3 +21,5 @@ npm start
 ```
 
 The production server serves the built app on port 3000 by default. Set `PORT` to change it and keep the `data` directory on persistent storage. Deploy the app server over HTTPS and back up its data directory. This is a small private chat app, not an end-to-end encrypted service; messages are stored in readable form on the server.
+
+For Android, deploy the server over HTTPS before opening the app. On first launch, enter the server's base URL (for example, `https://chat.example.com`); the address is saved on that device. To bake it into an APK instead, set `VITE_API_BASE_URL` when running `npm run android:apk`. If you host the web client on a separate domain, add its origin to the server's comma-separated `CORS_ORIGINS` environment variable. Capacitor's Android and iOS origins are allowed by default.

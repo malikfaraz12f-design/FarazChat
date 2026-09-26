@@ -60,10 +60,25 @@ database.exec(`
     attachment_name TEXT NOT NULL DEFAULT '',
     attachment_type TEXT NOT NULL DEFAULT '',
     attachment_size INTEGER NOT NULL DEFAULT 0,
+    attachment_waveform TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
   CREATE INDEX IF NOT EXISTS messages_conversation
     ON messages(sender_id, recipient_id, id);
+  CREATE TABLE IF NOT EXISTS message_reads (
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    reader_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    read_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (message_id, reader_id)
+  );
+  CREATE INDEX IF NOT EXISTS message_reads_reader ON message_reads(reader_id, message_id);
+  CREATE TABLE IF NOT EXISTS message_deliveries (
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    reader_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    delivered_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (message_id, reader_id)
+  );
+  CREATE INDEX IF NOT EXISTS message_deliveries_reader ON message_deliveries(reader_id, message_id);
   CREATE TABLE IF NOT EXISTS statuses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -82,6 +97,31 @@ database.exec(`
     viewed_at INTEGER NOT NULL,
     PRIMARY KEY (status_id, viewer_id)
   );
+  CREATE TABLE IF NOT EXISTS status_likes (
+    status_id INTEGER NOT NULL REFERENCES statuses(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    liked_at INTEGER NOT NULL,
+    PRIMARY KEY (status_id, user_id)
+  );
+  CREATE TABLE IF NOT EXISTS status_comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    status_id INTEGER NOT NULL REFERENCES statuses(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    body TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS status_comments_status ON status_comments(status_id, id);
+  CREATE TABLE IF NOT EXISTS status_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    status_id INTEGER NOT NULL REFERENCES statuses(id) ON DELETE CASCADE,
+    recipient_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('view', 'like', 'comment')),
+    body TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    read_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS status_notifications_inbox ON status_notifications(recipient_id, id DESC);
 `);
 
 const userColumns = new Set(database.pragma('table_info(users)').map((column) => column.name));
@@ -138,6 +178,9 @@ if (!messageColumns.has('attachment_type')) {
 if (!messageColumns.has('attachment_size')) {
   database.exec('ALTER TABLE messages ADD COLUMN attachment_size INTEGER NOT NULL DEFAULT 0');
 }
+if (!messageColumns.has('attachment_waveform')) {
+  database.exec("ALTER TABLE messages ADD COLUMN attachment_waveform TEXT NOT NULL DEFAULT ''");
+}
 if (!messageColumns.has('group_id')) {
   database.exec('ALTER TABLE messages ADD COLUMN group_id INTEGER REFERENCES chat_groups(id) ON DELETE CASCADE');
 }
@@ -177,17 +220,45 @@ const messageUpload = multer({
 const inlineImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 
 function publicMessage(message) {
-  const { attachment_path: filePath, attachment_name: name, attachment_type: type, attachment_size: size, ...publicFields } = message;
+  const { attachment_path: filePath, attachment_name: name, attachment_type: type, attachment_size: size, attachment_waveform: waveformData, ...publicFields } = message;
+  let waveform = [];
+  if (type?.startsWith('audio/') && waveformData) {
+    try {
+      const parsedWaveform = JSON.parse(waveformData);
+      if (Array.isArray(parsedWaveform) && parsedWaveform.length <= 64
+        && parsedWaveform.every((value) => Number.isFinite(value) && value >= 0 && value <= 1)) {
+        waveform = parsedWaveform;
+      }
+    } catch {}
+  }
   return {
     ...publicFields,
+    read_count: message.read_count ?? 0,
+    delivered_count: message.delivered_count ?? 0,
+    recipient_count: message.recipient_count ?? 1,
+    is_read: Boolean(message.is_read),
+    is_delivered: Boolean(message.is_delivered),
     attachment: filePath ? {
       name,
       type,
       size,
+      waveform,
       url: `/api/messages/${message.id}/attachment`,
       inline: inlineImageTypes.has(type),
     } : null,
   };
+}
+
+function attachmentWaveform(file, value) {
+  if (!file?.mimetype?.startsWith('audio/') || typeof value !== 'string') return '';
+  try {
+    const waveform = JSON.parse(value);
+    if (!Array.isArray(waveform) || waveform.length < 8 || waveform.length > 64
+      || !waveform.every((sample) => Number.isFinite(sample) && sample >= 0 && sample <= 1)) return '';
+    return JSON.stringify(waveform.map((sample) => Math.round(sample * 1000) / 1000));
+  } catch {
+    return '';
+  }
 }
 
 function groupMemberIds(groupId) {
@@ -200,6 +271,77 @@ function isGroupMember(groupId, userId) {
     .get(groupId, userId));
 }
 
+function recordConversationDelivered(readerId, { groupId = null, otherUserId = null } = {}) {
+  const directMessages = database.prepare(`
+    SELECT id, sender_id, NULL AS group_id FROM messages
+    WHERE group_id IS NULL AND recipient_id = ? AND sender_id != ?
+      AND (? IS NULL OR sender_id = ?)
+      AND NOT EXISTS (SELECT 1 FROM message_deliveries WHERE message_id = messages.id AND reader_id = ?)
+  `).all(readerId, readerId, otherUserId, otherUserId, readerId);
+  const groupIds = groupId === null
+    ? database.prepare('SELECT group_id FROM group_members WHERE user_id = ?').all(readerId).map((row) => row.group_id)
+    : [groupId];
+  const groupMessages = groupIds.flatMap((currentGroupId) => database.prepare(`
+    SELECT messages.id, messages.sender_id, messages.group_id FROM messages
+    WHERE messages.group_id = ? AND messages.sender_id != ?
+      AND NOT EXISTS (SELECT 1 FROM message_deliveries WHERE message_id = messages.id AND reader_id = ?)
+  `).all(currentGroupId, readerId, readerId));
+  const pending = [...directMessages, ...groupMessages];
+  if (!pending.length) return [];
+  const insertDelivery = database.prepare('INSERT OR IGNORE INTO message_deliveries (message_id, reader_id) VALUES (?, ?)');
+  const delivered = [];
+  database.transaction(() => {
+    for (const message of pending) {
+      if (insertDelivery.run(message.id, readerId).changes) delivered.push(message);
+    }
+  })();
+  const events = new Map();
+  for (const message of delivered) {
+    const isGroup = message.group_id !== null;
+    const key = isGroup ? `group:${message.group_id}` : `direct:${message.sender_id}`;
+    const event = events.get(key) || {
+      readerId,
+      messageIds: [],
+      groupId: isGroup ? message.group_id : null,
+      otherUserId: isGroup ? null : readerId,
+    };
+    event.messageIds.push(message.id);
+    events.set(key, event);
+  }
+  for (const event of events.values()) {
+    const recipients = event.groupId ? groupMemberIds(event.groupId) : [event.otherUserId === readerId
+      ? delivered.find((message) => event.messageIds.includes(message.id))?.sender_id
+      : null].filter(Boolean);
+    for (const userId of recipients) io.to(`user:${userId}`).emit('messages:delivered', event);
+  }
+  return delivered.map((message) => message.id);
+}
+
+function recordConversationRead(readerId, { groupId = null, otherUserId = null }) {
+  recordConversationDelivered(readerId, { groupId, otherUserId });
+  const unreadMessages = groupId
+    ? database.prepare(`
+      SELECT messages.id FROM messages
+      WHERE messages.group_id = ? AND messages.sender_id != ?
+        AND NOT EXISTS (SELECT 1 FROM message_reads WHERE message_id = messages.id AND reader_id = ?)
+    `).all(groupId, readerId, readerId)
+    : database.prepare(`
+      SELECT messages.id FROM messages
+      WHERE messages.group_id IS NULL AND messages.sender_id = ? AND messages.recipient_id = ?
+        AND NOT EXISTS (SELECT 1 FROM message_reads WHERE message_id = messages.id AND reader_id = ?)
+    `).all(otherUserId, readerId, readerId);
+  const messageIds = unreadMessages.map((message) => message.id);
+  if (!messageIds.length) return messageIds;
+  const insertRead = database.prepare('INSERT OR IGNORE INTO message_reads (message_id, reader_id) VALUES (?, ?)');
+  database.transaction(() => {
+    for (const messageId of messageIds) insertRead.run(messageId, readerId);
+  })();
+  const event = { readerId, messageIds, groupId, otherUserId };
+  const recipients = groupId ? groupMemberIds(groupId) : [otherUserId];
+  for (const userId of recipients) io.to(`user:${userId}`).emit('messages:read', event);
+  return messageIds;
+}
+
 function publicStatus(status) {
   return {
     id: status.id,
@@ -208,6 +350,8 @@ function publicStatus(status) {
     expires_at: status.expires_at,
     viewed: Boolean(status.viewed),
     views_count: status.views_count ?? 0,
+    liked: Boolean(status.liked),
+    likes_count: status.likes_count ?? 0,
     attachment: status.attachment_path ? {
       name: status.attachment_name,
       type: status.attachment_type,
@@ -283,8 +427,38 @@ function requireAuth(request, response, next) {
 }
 
 const app = express();
+const allowedOrigins = new Set([
+  'https://localhost',
+  'capacitor://localhost',
+  'http://localhost',
+  ...(process.env.CORS_ORIGINS ?? '').split(',').map((origin) => origin.trim()).filter(Boolean),
+]);
+app.use((request, response, next) => {
+  const origin = request.headers.origin;
+  response.vary('Origin');
+  if (origin && allowedOrigins.has(origin)) {
+    response.setHeader('Access-Control-Allow-Origin', origin);
+    response.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
+    response.setHeader('Access-Control-Allow-Headers', request.headers['access-control-request-headers'] || 'Authorization, Content-Type');
+    response.setHeader('Access-Control-Max-Age', '86400');
+    if (request.method === 'OPTIONS') return response.sendStatus(204);
+  }
+  next();
+});
 app.use(express.json({ limit: '16kb' }));
 app.use('/uploads/avatars', express.static(avatarDirectory, { maxAge: '1d', immutable: true }));
+
+app.post('/api/auth/check-code', (request, response) => {
+  const contactCode = typeof request.body.contactCode === 'string' ? request.body.contactCode.trim() : '';
+  if (!/^\d{8}$/.test(contactCode)) {
+    return response.status(400).json({ error: 'Choose a code with exactly 8 digits.' });
+  }
+  const existingCode = database.prepare('SELECT 1 FROM users WHERE contact_code = ? OR username = ?').get(contactCode, contactCode);
+  if (existingCode) {
+    return response.status(409).json({ error: 'That 8-digit code is already taken. Choose another one.' });
+  }
+  response.json({ available: true });
+});
 
 app.post('/api/auth/register', async (request, response) => {
   const contactCode = typeof request.body.contactCode === 'string' ? request.body.contactCode.trim() : '';
@@ -507,20 +681,46 @@ app.get('/api/conversations/:userId/messages', requireAuth, (request, response) 
   if (!Number.isInteger(otherId) || otherId <= 0 || otherId === request.user.id) {
     return response.status(400).json({ error: 'Choose a valid conversation.' });
   }
+  recordConversationRead(request.user.id, { otherUserId: otherId });
   const messages = database.prepare(`
     SELECT messages.id, messages.sender_id, messages.recipient_id, messages.body,
       messages.attachment_path, messages.attachment_name, messages.attachment_type,
-      messages.attachment_size, messages.created_at, users.username AS sender_username
+      messages.attachment_size, messages.attachment_waveform, messages.created_at, users.username AS sender_username,
+      (SELECT COUNT(*) FROM message_reads WHERE message_id = messages.id) AS read_count,
+      (SELECT COUNT(*) FROM message_deliveries WHERE message_id = messages.id) AS delivered_count,
+      1 AS recipient_count,
+      EXISTS(SELECT 1 FROM message_deliveries WHERE message_id = messages.id AND reader_id = ?) AS is_delivered,
+      EXISTS(SELECT 1 FROM message_reads WHERE message_id = messages.id AND reader_id = ?) AS is_read
     FROM messages JOIN users ON users.id = messages.sender_id
     WHERE (messages.sender_id = ? AND messages.recipient_id = ?)
        OR (messages.sender_id = ? AND messages.recipient_id = ?)
     ORDER BY messages.id DESC LIMIT 100
-  `).all(request.user.id, otherId, otherId, request.user.id).reverse();
+  `).all(otherId, otherId, request.user.id, otherId, otherId, request.user.id).reverse();
   response.json({ messages: messages.map(publicMessage) });
 });
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, { cors: { origin: true, credentials: true } });
+
+app.post('/api/messages/read', requireAuth, (request, response) => {
+  if (request.body.groupId !== undefined) {
+    const groupId = Number(request.body.groupId);
+    if (!Number.isInteger(groupId) || groupId <= 0 || !isGroupMember(groupId, request.user.id)) {
+      return response.status(404).json({ error: 'Group not found.' });
+    }
+    const messageIds = recordConversationRead(request.user.id, { groupId });
+    return response.json({ messageIds, groupId, otherUserId: null });
+  }
+  const otherUserId = Number(request.body.otherUserId);
+  if (!Number.isInteger(otherUserId) || otherUserId <= 0 || otherUserId === request.user.id) {
+    return response.status(400).json({ error: 'Choose a valid conversation.' });
+  }
+  if (!database.prepare('SELECT 1 FROM users WHERE id = ?').get(otherUserId)) {
+    return response.status(404).json({ error: 'That account could not be found.' });
+  }
+  const messageIds = recordConversationRead(request.user.id, { otherUserId });
+  response.json({ messageIds, groupId: null, otherUserId });
+});
 
 io.use((socket, next) => {
   try {
@@ -541,6 +741,7 @@ io.on('connection', (socket) => {
   onlineSockets.set(socket.user.id, socketIds);
   socket.emit('presence:sync', [...onlineSockets.keys()].filter((userId) => userId !== socket.user.id));
   if (!wasOnline) io.emit('presence:update', { userId: socket.user.id, online: true });
+  recordConversationDelivered(socket.user.id);
 
   socket.on('typing', (event) => {
     const groupId = Number(event?.groupId);
@@ -622,13 +823,14 @@ app.post('/api/messages', requireAuth, (request, response, next) => {
   const recipient = database.prepare('SELECT id FROM users WHERE id = ?').get(recipientId);
   if (!recipient) return response.status(404).json({ error: 'That account could not be found.' });
   const file = request.file;
+  const waveform = attachmentWaveform(file, request.body.waveform);
   const attachmentPath = file ? `${crypto.randomUUID()}.upload` : '';
   if (file) fs.writeFileSync(path.join(messageFileDirectory, attachmentPath), file.buffer, { flag: 'wx', mode: 0o600 });
   try {
     const result = database.prepare(`
       INSERT INTO messages (
-        sender_id, recipient_id, body, attachment_path, attachment_name, attachment_type, attachment_size
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        sender_id, recipient_id, body, attachment_path, attachment_name, attachment_type, attachment_size, attachment_waveform
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       request.user.id,
       recipientId,
@@ -637,13 +839,20 @@ app.post('/api/messages', requireAuth, (request, response, next) => {
       file ? path.basename(file.originalname).slice(0, 180) : '',
       file ? file.mimetype : '',
       file ? file.size : 0,
+      waveform,
     );
+    if (onlineSockets.get(recipientId)?.size) {
+      recordConversationDelivered(recipientId, { otherUserId: request.user.id });
+    }
     const message = publicMessage(database.prepare(`
       SELECT messages.id, messages.sender_id, messages.recipient_id, messages.body,
         messages.attachment_path, messages.attachment_name, messages.attachment_type,
-        messages.attachment_size, messages.created_at, users.username AS sender_username
+        messages.attachment_size, messages.attachment_waveform, messages.created_at, users.username AS sender_username,
+        (SELECT COUNT(*) FROM message_deliveries WHERE message_id = messages.id) AS delivered_count,
+        1 AS recipient_count,
+        EXISTS(SELECT 1 FROM message_deliveries WHERE message_id = messages.id AND reader_id = ?) AS is_delivered
       FROM messages JOIN users ON users.id = messages.sender_id WHERE messages.id = ?
-    `).get(result.lastInsertRowid));
+    `).get(recipientId, result.lastInsertRowid));
     io.to(`user:${request.user.id}`).to(`user:${recipientId}`).emit('message', message);
     response.status(201).json({ message });
   } catch (error) {
@@ -735,11 +944,19 @@ app.get('/api/groups/:groupId/messages', requireAuth, (request, response) => {
   if (!Number.isInteger(groupId) || groupId <= 0 || !isGroupMember(groupId, request.user.id)) {
     return response.status(404).json({ error: 'Group not found.' });
   }
+  recordConversationRead(request.user.id, { groupId });
   const messages = database.prepare(`
     SELECT messages.id, messages.sender_id, messages.recipient_id, messages.group_id, messages.body,
       messages.attachment_path, messages.attachment_name, messages.attachment_type,
-      messages.attachment_size, messages.created_at,
-      users.username AS sender_username, users.display_name AS sender_display_name
+      messages.attachment_size, messages.attachment_waveform, messages.created_at,
+      users.username AS sender_username, users.display_name AS sender_display_name,
+      (SELECT COUNT(*) FROM message_reads WHERE message_id = messages.id) AS read_count,
+      (SELECT COUNT(*) FROM message_deliveries WHERE message_id = messages.id) AS delivered_count,
+      (SELECT COUNT(*) - 1 FROM group_members WHERE group_id = messages.group_id) AS recipient_count,
+      (SELECT COUNT(*) FROM message_deliveries WHERE message_id = messages.id)
+        >= (SELECT COUNT(*) - 1 FROM group_members WHERE group_id = messages.group_id) AS is_delivered,
+      (SELECT COUNT(*) FROM message_reads WHERE message_id = messages.id)
+        >= (SELECT COUNT(*) - 1 FROM group_members WHERE group_id = messages.group_id) AS is_read
     FROM messages JOIN users ON users.id = messages.sender_id
     WHERE messages.group_id = ? ORDER BY messages.id DESC LIMIT 100
   `).all(groupId).reverse();
@@ -764,13 +981,15 @@ app.post('/api/groups/:groupId/messages', requireAuth, (request, response, next)
     return response.status(400).json({ error: 'Add a message or choose a file. Messages are limited to 4000 characters.' });
   }
   const file = request.file;
+  const waveform = attachmentWaveform(file, request.body.waveform);
   const attachmentPath = file ? `${crypto.randomUUID()}.upload` : '';
   if (file) fs.writeFileSync(path.join(messageFileDirectory, attachmentPath), file.buffer, { flag: 'wx', mode: 0o600 });
   try {
     const result = database.prepare(`
       INSERT INTO messages (
-        sender_id, recipient_id, group_id, body, attachment_path, attachment_name, attachment_type, attachment_size
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        sender_id, recipient_id, group_id, body, attachment_path, attachment_name, attachment_type, attachment_size,
+        attachment_waveform
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       request.user.id,
       request.user.id,
@@ -780,12 +999,24 @@ app.post('/api/groups/:groupId/messages', requireAuth, (request, response, next)
       file ? path.basename(file.originalname).slice(0, 180) : '',
       file ? file.mimetype : '',
       file ? file.size : 0,
+      waveform,
     );
+    for (const userId of groupMemberIds(groupId)) {
+      if (userId !== request.user.id && onlineSockets.get(userId)?.size) {
+        recordConversationDelivered(userId, { groupId });
+      }
+    }
     const message = publicMessage(database.prepare(`
       SELECT messages.id, messages.sender_id, messages.recipient_id, messages.group_id, messages.body,
         messages.attachment_path, messages.attachment_name, messages.attachment_type,
-        messages.attachment_size, messages.created_at,
-        users.username AS sender_username, users.display_name AS sender_display_name
+        messages.attachment_size, messages.attachment_waveform, messages.created_at,
+        users.username AS sender_username, users.display_name AS sender_display_name,
+        (SELECT COUNT(*) FROM message_reads WHERE message_id = messages.id) AS read_count,
+        (SELECT COUNT(*) FROM message_deliveries WHERE message_id = messages.id) AS delivered_count,
+        (SELECT COUNT(*) - 1 FROM group_members WHERE group_id = messages.group_id) AS recipient_count,
+        (SELECT COUNT(*) FROM message_deliveries WHERE message_id = messages.id)
+          >= (SELECT COUNT(*) - 1 FROM group_members WHERE group_id = messages.group_id) AS is_delivered,
+        0 AS is_read
       FROM messages JOIN users ON users.id = messages.sender_id WHERE messages.id = ?
     `).get(result.lastInsertRowid));
     for (const userId of groupMemberIds(groupId)) io.to(`user:${userId}`).emit('message', message);
@@ -852,11 +1083,13 @@ app.get('/api/statuses', requireAuth, (request, response) => {
       users.bio, users.notifications_enabled, users.discoverable, users.dark_mode,
       users.avatar_path,
       EXISTS(SELECT 1 FROM status_views WHERE status_id = statuses.id AND viewer_id = ?) AS viewed,
-      (SELECT COUNT(*) FROM status_views WHERE status_id = statuses.id) AS views_count
+      (SELECT COUNT(*) FROM status_views WHERE status_id = statuses.id) AS views_count,
+      EXISTS(SELECT 1 FROM status_likes WHERE status_id = statuses.id AND user_id = ?) AS liked,
+      (SELECT COUNT(*) FROM status_likes WHERE status_id = statuses.id) AS likes_count
     FROM statuses JOIN users ON users.id = statuses.user_id
     WHERE statuses.expires_at > ? AND (statuses.user_id = ? OR users.discoverable = 1)
-    ORDER BY statuses.created_at
-  `).all(request.user.id, now, request.user.id);
+    ORDER BY statuses.created_at DESC, statuses.id DESC
+  `).all(request.user.id, request.user.id, now, request.user.id);
   const feed = new Map();
   for (const status of statuses) {
     if (!feed.has(status.user_id)) {
@@ -889,11 +1122,162 @@ app.post('/api/statuses/:statusId/view', requireAuth, (request, response) => {
   `).get(statusId, Date.now(), request.user.id);
   if (!status) return response.status(404).json({ error: 'Status not found.' });
   if (status.user_id !== request.user.id) {
+    const alreadyViewed = database.prepare('SELECT 1 FROM status_views WHERE status_id = ? AND viewer_id = ?')
+      .get(statusId, request.user.id);
     database.prepare(`
       INSERT INTO status_views (status_id, viewer_id, viewed_at) VALUES (?, ?, ?)
       ON CONFLICT(status_id, viewer_id) DO UPDATE SET viewed_at = excluded.viewed_at
     `).run(statusId, request.user.id, Date.now());
+    if (!alreadyViewed) createStatusNotification(statusId, status.user_id, request.user, 'view');
   }
+  response.json({ success: true });
+});
+
+function accessibleStatus(statusId, userId) {
+  return database.prepare(`
+    SELECT statuses.id, statuses.user_id FROM statuses JOIN users ON users.id = statuses.user_id
+    WHERE statuses.id = ? AND statuses.expires_at > ? AND (statuses.user_id = ? OR users.discoverable = 1)
+  `).get(statusId, Date.now(), userId);
+}
+
+function createStatusNotification(statusId, recipientId, actor, kind, body = '') {
+  if (recipientId === actor.id) return null;
+  const createdAt = Date.now();
+  const result = database.prepare(`
+    INSERT INTO status_notifications (status_id, recipient_id, actor_id, kind, body, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(statusId, recipientId, actor.id, kind, body, createdAt);
+  const notification = {
+    id: Number(result.lastInsertRowid),
+    status_id: statusId,
+    kind,
+    body,
+    created_at: createdAt,
+    read_at: null,
+    actor: publicUser(actor),
+  };
+  io.to(`user:${recipientId}`).emit('status:notification', notification);
+  return notification;
+}
+
+app.get('/api/status-notifications', requireAuth, (request, response) => {
+  const rows = database.prepare(`
+    SELECT status_notifications.id, status_notifications.status_id, status_notifications.kind,
+      status_notifications.body, status_notifications.created_at, status_notifications.read_at,
+      users.id AS actor_id, users.username, users.contact_code, users.display_name, users.avatar_path
+    FROM status_notifications
+    JOIN statuses ON statuses.id = status_notifications.status_id
+    JOIN users ON users.id = status_notifications.actor_id
+    WHERE status_notifications.recipient_id = ? AND statuses.expires_at > ?
+    ORDER BY status_notifications.id DESC LIMIT 100
+  `).all(request.user.id, Date.now());
+  response.json({
+    unread_count: rows.filter((row) => row.read_at === null).length,
+    notifications: rows.map((row) => ({
+      id: row.id,
+      status_id: row.status_id,
+      kind: row.kind,
+      body: row.body,
+      created_at: row.created_at,
+      read_at: row.read_at,
+      actor: publicUser({ ...row, id: row.actor_id }),
+    })),
+  });
+});
+
+app.post('/api/status-notifications/read', requireAuth, (request, response) => {
+  const result = database.prepare(`
+    UPDATE status_notifications SET read_at = ?
+    WHERE recipient_id = ? AND read_at IS NULL
+  `).run(Date.now(), request.user.id);
+  response.json({ updated: result.changes });
+});
+
+app.get('/api/statuses/:statusId/interactions', requireAuth, (request, response) => {
+  const statusId = Number(request.params.statusId);
+  const status = Number.isInteger(statusId) ? accessibleStatus(statusId, request.user.id) : null;
+  if (!status) return response.status(404).json({ error: 'Status not found.' });
+  const liked = Boolean(database.prepare('SELECT 1 FROM status_likes WHERE status_id = ? AND user_id = ?').get(statusId, request.user.id));
+  const likesCount = database.prepare('SELECT COUNT(*) AS count FROM status_likes WHERE status_id = ?').get(statusId).count;
+  const viewers = status.user_id === request.user.id
+    ? database.prepare(`
+      SELECT users.id, users.username, users.contact_code, users.display_name, users.avatar_path, status_views.viewed_at
+      FROM status_views JOIN users ON users.id = status_views.viewer_id
+      WHERE status_views.status_id = ? ORDER BY status_views.viewed_at DESC
+    `).all(statusId).map((viewer) => ({ ...publicUser(viewer), viewed_at: viewer.viewed_at }))
+    : [];
+  const comments = database.prepare(`
+    SELECT status_comments.id, status_comments.body, status_comments.created_at,
+      users.id AS commenter_id, users.username, users.contact_code, users.display_name, users.avatar_path
+    FROM status_comments JOIN users ON users.id = status_comments.user_id
+    WHERE status_comments.status_id = ? ORDER BY status_comments.id
+  `).all(statusId).map((comment) => ({
+    id: comment.id,
+    body: comment.body,
+    created_at: comment.created_at,
+    user: publicUser({ ...comment, id: comment.commenter_id }),
+  }));
+  response.json({
+    liked,
+    likes_count: likesCount,
+    views_count: database.prepare('SELECT COUNT(*) AS count FROM status_views WHERE status_id = ?').get(statusId).count,
+    viewers,
+    comments,
+  });
+});
+
+app.put('/api/statuses/:statusId/like', requireAuth, (request, response) => {
+  const statusId = Number(request.params.statusId);
+  const status = Number.isInteger(statusId) ? accessibleStatus(statusId, request.user.id) : null;
+  if (!status) return response.status(404).json({ error: 'Status not found.' });
+  if (typeof request.body.liked !== 'boolean') {
+    return response.status(400).json({ error: 'Choose whether to like this status.' });
+  }
+  if (request.body.liked) {
+    const result = database.prepare('INSERT OR IGNORE INTO status_likes (status_id, user_id, liked_at) VALUES (?, ?, ?)')
+      .run(statusId, request.user.id, Date.now());
+    if (result.changes) createStatusNotification(statusId, status.user_id, request.user, 'like');
+  } else {
+    database.prepare('DELETE FROM status_likes WHERE status_id = ? AND user_id = ?').run(statusId, request.user.id);
+  }
+  response.json({
+    liked: request.body.liked,
+    likes_count: database.prepare('SELECT COUNT(*) AS count FROM status_likes WHERE status_id = ?').get(statusId).count,
+  });
+});
+
+app.post('/api/statuses/:statusId/comments', requireAuth, (request, response) => {
+  const statusId = Number(request.params.statusId);
+  const status = Number.isInteger(statusId) ? accessibleStatus(statusId, request.user.id) : null;
+  if (!status) return response.status(404).json({ error: 'Status not found.' });
+  const body = typeof request.body.body === 'string' ? request.body.body.trim() : '';
+  if (!body || body.length > 500) {
+    return response.status(400).json({ error: 'Comments must be between 1 and 500 characters.' });
+  }
+  const createdAt = Date.now();
+  const result = database.prepare('INSERT INTO status_comments (status_id, user_id, body, created_at) VALUES (?, ?, ?, ?)')
+    .run(statusId, request.user.id, body, createdAt);
+  createStatusNotification(statusId, status.user_id, request.user, 'comment', body);
+  response.status(201).json({
+    comment: {
+      id: Number(result.lastInsertRowid),
+      body,
+      created_at: createdAt,
+      user: publicUser(request.user),
+    },
+  });
+});
+
+app.delete('/api/statuses/:statusId/comments/:commentId', requireAuth, (request, response) => {
+  const statusId = Number(request.params.statusId);
+  const commentId = Number(request.params.commentId);
+  const status = Number.isInteger(statusId) ? accessibleStatus(statusId, request.user.id) : null;
+  if (!status || !Number.isInteger(commentId)) return response.status(404).json({ error: 'Comment not found.' });
+  const comment = database.prepare('SELECT user_id FROM status_comments WHERE id = ? AND status_id = ?').get(commentId, statusId);
+  if (!comment || (comment.user_id !== request.user.id && status.user_id !== request.user.id)) {
+    return response.status(404).json({ error: 'Comment not found.' });
+  }
+  database.prepare('DELETE FROM status_comments WHERE id = ?').run(commentId);
   response.json({ success: true });
 });
 

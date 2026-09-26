@@ -1,30 +1,67 @@
 import { useEffect, useRef, useState } from 'react';
+import { Capacitor } from '@capacitor/core';
 import { io } from 'socket.io-client';
 import {
-  ArrowLeft, Bell, Camera, Check, Download, FileText, ImagePlus, KeyRound, LockKeyhole,
-  LogOut, MessageCircle, Moon, Paperclip, Plus, Search, Send, Settings, Shield, ShieldCheck,
+  ArrowLeft, Bell, Camera, Check, CheckCheck, Download, Eye, FileText, Heart, ImagePlus, KeyRound, LockKeyhole,
+  LogOut, MessageCircle, Mic, Moon, Paperclip, Pause, Play, Plus, Search, Send, Settings, Shield, ShieldCheck,
   Smile, UserRound, UsersRound, X,
 } from 'lucide-react';
 
 const TOKEN_KEY = 'farazchat-token';
+const API_BASE_URL_KEY = 'farazchat-api-base-url';
+const CHAT_WALLPAPER_KEY = 'farazchat-chat-wallpaper';
+const APP_THEME_KEY = 'farazchat-app-theme';
 
-const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
+const currentOrigin = typeof window !== 'undefined' && window.location && window.location.origin ? window.location.origin : '';
+const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || localStorage.getItem(API_BASE_URL_KEY) || currentOrigin || '').replace(/\/+$/, '');
 
 function apiUrl(path) {
   if (/^(https?:|blob:|data:)/.test(path)) return path;
   return apiBaseUrl ? `${apiBaseUrl}${path.startsWith('/') ? '' : '/'}${path}` : path;
 }
 
+function compressWallpaper(file) {
+  return new Promise((resolve, reject) => {
+    const sourceUrl = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(sourceUrl);
+      try {
+        const scale = Math.min(1, 1440 / Math.max(image.naturalWidth, image.naturalHeight));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+        canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+        const context = canvas.getContext('2d');
+        if (!context) throw new Error('Could not process that image.');
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL('image/jpeg', 0.76));
+      } catch {
+        reject(new Error('Could not process that image.'));
+      }
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(sourceUrl);
+      reject(new Error('Could not open that image.'));
+    };
+    image.src = sourceUrl;
+  });
+}
+
 async function api(path, token, options = {}) {
   const isFormData = options.body instanceof FormData;
-  const response = await fetch(apiUrl(path), {
-    ...options,
-    headers: {
-      ...(options.body && !isFormData ? { 'Content-Type': 'application/json' } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...options.headers,
-    },
-  });
+  let response;
+  try {
+    response = await fetch(apiUrl(path), {
+      ...options,
+      headers: {
+        ...(options.body && !isFormData ? { 'Content-Type': 'application/json' } : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...options.headers,
+      },
+    });
+  } catch {
+    throw new Error('Cannot reach the FarazChat server. Check the server address and your internet connection.');
+  }
   const result = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(result.error || 'Something went wrong. Try again.');
   return result;
@@ -64,6 +101,90 @@ function formatFileSize(size) {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function formatAudioTime(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '0:00';
+  return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
+}
+
+function compactWaveform(samples, barCount = 48) {
+  if (!samples.length) return Array.from({ length: barCount }, () => 0.08);
+  return Array.from({ length: barCount }, (_unused, index) => {
+    const start = Math.floor(index * samples.length / barCount);
+    const end = Math.max(start + 1, Math.floor((index + 1) * samples.length / barCount));
+    let peak = 0;
+    for (let sampleIndex = start; sampleIndex < Math.min(end, samples.length); sampleIndex += 1) {
+      peak = Math.max(peak, samples[sampleIndex]);
+    }
+    return Math.round(Math.max(0.08, Math.min(1, peak)) * 1000) / 1000;
+  });
+}
+
+function VoiceNotePlayer({ src, waveform = [] }) {
+  const audioRef = useRef(null);
+  const [playing, setPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const bars = waveform.length >= 8
+    ? waveform
+    : Array.from({ length: 48 }, (_unused, index) => 0.18 + ((index * 37 + 11) % 24) / 30);
+  const progress = duration ? currentTime / duration : 0;
+
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return undefined;
+    const updateTime = () => setCurrentTime(audio.currentTime);
+    const updateDuration = () => setDuration(Number.isFinite(audio.duration) ? audio.duration : 0);
+    const play = () => setPlaying(true);
+    const pause = () => setPlaying(false);
+    audio.addEventListener('timeupdate', updateTime);
+    audio.addEventListener('loadedmetadata', updateDuration);
+    audio.addEventListener('play', play);
+    audio.addEventListener('pause', pause);
+    audio.addEventListener('ended', pause);
+    return () => {
+      audio.removeEventListener('timeupdate', updateTime);
+      audio.removeEventListener('loadedmetadata', updateDuration);
+      audio.removeEventListener('play', play);
+      audio.removeEventListener('pause', pause);
+      audio.removeEventListener('ended', pause);
+    };
+  }, [src]);
+
+  async function togglePlayback() {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (audio.paused) {
+      try {
+        await audio.play();
+      } catch {
+        setPlaying(false);
+      }
+    } else {
+      audio.pause();
+    }
+  }
+
+  function seek(event) {
+    const audio = audioRef.current;
+    if (!audio || !duration) return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    audio.currentTime = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)) * duration;
+  }
+
+  return (
+    <div className="voice-note-player">
+      <audio ref={audioRef} src={src} preload="metadata" />
+      <button className="voice-play-button" type="button" onClick={togglePlayback} aria-label={playing ? 'Pause voice note' : 'Play voice note'}>{playing ? <Pause size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" />}</button>
+      <div className="voice-note-track">
+        <button className="voice-waveform" type="button" onClick={seek} aria-label="Seek voice note" title="Seek voice note">
+          {bars.map((amplitude, index) => <i key={index} className={index / bars.length < progress ? 'is-played' : ''} style={{ height: `${Math.round(20 + amplitude * 80)}%` }} />)}
+        </button>
+        <span>{formatAudioTime(currentTime || duration)}</span>
+      </div>
+    </div>
+  );
+}
+
 function AttachmentCard({ attachment, token }) {
   const [url, setUrl] = useState('');
   const [failed, setFailed] = useState(false);
@@ -95,7 +216,7 @@ function AttachmentCard({ attachment, token }) {
     return <a className="message-attachment-image" href={url} target="_blank" rel="noreferrer"><img src={url} alt={attachment.name} loading="lazy" /></a>;
   }
   if (attachment.type.startsWith('audio/')) {
-    return <audio className="message-attachment-media" controls preload="metadata" src={url}>{attachment.name}</audio>;
+    return <VoiceNotePlayer src={url} waveform={attachment.waveform} />;
   }
   if (attachment.type.startsWith('video/')) {
     return <video className="message-attachment-media" controls preload="metadata" src={url}>{attachment.name}</video>;
@@ -143,6 +264,7 @@ function ContactProfileModal({ token, person, online, savedName, onClose, onSave
 }
 
 function AuthScreen({ onLogin }) {
+  const isNativePlatform = Capacitor.isNativePlatform();
   const [screen, setScreen] = useState('welcome');
   const [registerStep, setRegisterStep] = useState(1);
   const [displayName, setDisplayName] = useState('');
@@ -155,11 +277,35 @@ function AuthScreen({ onLogin }) {
   const [policiesAccepted, setPoliciesAccepted] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [showServerSetup, setShowServerSetup] = useState(false);
+  const [serverAddress, setServerAddress] = useState(apiBaseUrl);
+  const [codeAvailability, setCodeAvailability] = useState('');
 
   useEffect(() => {
     if (!photoPreview.startsWith('blob:')) return undefined;
     return () => URL.revokeObjectURL(photoPreview);
   }, [photoPreview]);
+
+  useEffect(() => {
+    if (screen !== 'register' || registerStep !== 1 || !/^\d{8}$/.test(contactCode)) return undefined;
+    let active = true;
+    setCodeAvailability('checking');
+    const timer = setTimeout(async () => {
+      try {
+        await api('/api/auth/check-code', null, {
+          method: 'POST',
+          body: JSON.stringify({ contactCode }),
+        });
+        if (active) setCodeAvailability('available');
+      } catch (requestError) {
+        if (active) setCodeAvailability(requestError.message.includes('already taken') ? 'taken' : 'unavailable');
+      }
+    }, 250);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [screen, registerStep, contactCode]);
 
   function selectPhoto(event) {
     const file = event.target.files?.[0];
@@ -174,10 +320,25 @@ function AuthScreen({ onLogin }) {
     setError('');
   }
 
-  function continueRegistration() {
+  async function continueRegistration() {
     setError('');
     if (registerStep === 1 && !/^\d{8}$/.test(contactCode)) {
       setError('Enter a valid 8-digit code.');
+      return;
+    }
+    if (registerStep === 1) {
+      setBusy(true);
+      try {
+        await api('/api/auth/check-code', null, {
+          method: 'POST',
+          body: JSON.stringify({ contactCode }),
+        });
+        setRegisterStep(2);
+      } catch (requestError) {
+        setError(requestError.message);
+      } finally {
+        setBusy(false);
+      }
       return;
     }
     if (registerStep === 2) {
@@ -195,6 +356,21 @@ function AuthScreen({ onLogin }) {
       return;
     }
     setRegisterStep((step) => Math.min(step + 1, 4));
+  }
+
+  function saveServerAddress(event) {
+    event.preventDefault();
+    setError('');
+    try {
+      const serverUrl = new URL(serverAddress.trim());
+      if (serverUrl.protocol !== 'https:' || serverUrl.username || serverUrl.password || serverUrl.search || serverUrl.hash) {
+        throw new Error('Invalid server URL');
+      }
+      localStorage.setItem(API_BASE_URL_KEY, serverUrl.toString().replace(/\/+$/, ''));
+      window.location.reload();
+    } catch {
+      setError('Enter a valid HTTPS address for your FarazChat server.');
+    }
   }
 
   async function submit(event) {
@@ -232,7 +408,8 @@ function AuthScreen({ onLogin }) {
           <div className="auth-footnote"><ShieldCheck size={17} /><span>Accounts and messages stay on your FarazChat server.</span></div>
         </div>
         <div className="auth-form-wrap">
-          {screen === 'welcome' && <div className="auth-choice-screen"><span className="form-icon"><MessageCircle size={19} /></span><h2>Welcome to FarazChat</h2><p>Choose how you want to continue.</p><button className="primary-button" onClick={() => setScreen('register')}>Create account <span>→</span></button><button className="secondary-button" onClick={() => setScreen('login')}>Log in <span>→</span></button></div>}
+          {screen === 'welcome' && showServerSetup && <div className="auth-choice-screen"><span className="form-icon"><MessageCircle size={19} /></span><h2>Connect to your server</h2><p>Enter the HTTPS address where your FarazChat server is hosted.</p><form className="auth-form" onSubmit={saveServerAddress}><label htmlFor="server-address">Server address</label><div className="field-with-icon"><LockKeyhole size={17} /><input id="server-address" type="url" autoComplete="url" autoCapitalize="off" spellCheck="false" value={serverAddress} onChange={(event) => setServerAddress(event.target.value)} placeholder="https://chat.example.com" required /></div>{error && <p className="form-error" role="alert">{error}</p>}<button className="primary-button auth-submit" type="submit">Connect <span>→</span></button><button type="button" className="secondary-button" onClick={() => { setShowServerSetup(false); setError(''); }}>Back</button></form></div>}
+          {screen === 'welcome' && !showServerSetup && <div className="auth-choice-screen"><span className="form-icon"><MessageCircle size={19} /></span><h2>Welcome to FarazChat</h2><p>Choose how you want to continue.</p><button className="primary-button" onClick={() => setScreen('register')}>Create account <span>→</span></button><button className="secondary-button" onClick={() => setScreen('login')}>Log in <span>→</span></button>{isNativePlatform && <button className="ghost-button" type="button" style={{ marginTop: '8px', width: '100%' }} onClick={() => setShowServerSetup(true)}>Use custom server</button>}</div>}
           {screen === 'login' && <>
             <div className="auth-form-heading"><span className="form-icon"><LockKeyhole size={19} /></span><div><h2>Log in</h2><p>Enter your 8-digit contact code and password.</p></div></div>
             <form className="auth-form" onSubmit={submit}>
@@ -252,8 +429,8 @@ function AuthScreen({ onLogin }) {
               {registerStep === 1 && <>
                 <div className="auth-form-heading"><span className="form-icon"><UserRound size={19} /></span><div><h2>Choose your code</h2><p>People will use this unique code to find you.</p></div></div>
                 <label htmlFor="register-code">8-digit contact code</label>
-                <div className="field-with-icon"><span className="code-prefix">#</span><input id="register-code" inputMode="numeric" autoComplete="off" value={contactCode} onChange={(event) => setContactCode(event.target.value.replace(/\D/g, '').slice(0, 8))} placeholder="8 numbers" pattern="[0-9]{8}" minLength={8} maxLength={8} required /></div>
-                <p className="auth-hint">Use this code to log in and let friends find you.</p>
+                <div className="field-with-icon"><span className="code-prefix">#</span><input id="register-code" inputMode="numeric" autoComplete="off" value={contactCode} onChange={(event) => { const nextCode = event.target.value.replace(/\D/g, '').slice(0, 8); setContactCode(nextCode); setError(''); setCodeAvailability(/^\d{8}$/.test(nextCode) ? 'checking' : ''); }} placeholder="8 numbers" pattern="[0-9]{8}" minLength={8} maxLength={8} disabled={busy} required /></div>
+                <p className={`code-availability${codeAvailability ? ` code-availability-${codeAvailability}` : ''}`} role={codeAvailability === 'taken' ? 'alert' : 'status'} aria-live="polite">{codeAvailability === 'checking' ? 'Checking code…' : codeAvailability === 'available' ? 'This code is available.' : codeAvailability === 'taken' ? 'This code is already in use. Choose another.' : codeAvailability === 'unavailable' ? 'Could not check this code. Tap Continue to retry.' : 'Use this code to log in and let friends find you.'}</p>
               </>}
               {registerStep === 2 && <>
                 <div className="auth-form-heading"><span className="form-icon"><LockKeyhole size={19} /></span><div><h2>Secure your account</h2><p>Choose a password and confirm it.</p></div></div>
@@ -276,7 +453,7 @@ function AuthScreen({ onLogin }) {
                 <label className="policy-consent"><input type="checkbox" checked={policiesAccepted} onChange={(event) => setPoliciesAccepted(event.target.checked)} /><span>I understand and agree to these account policies.</span></label>
               </>}
               {error && <p className="form-error" role="alert">{error}</p>}
-              <div className="register-step-actions">{registerStep > 1 && <button type="button" className="secondary-button" onClick={() => { setError(''); setRegisterStep((step) => step - 1); }}>Back</button>}<button type="submit" className="primary-button auth-submit" disabled={busy || (registerStep === 4 && !policiesAccepted)}>{busy ? 'Creating…' : registerStep === 4 ? 'Create account' : 'Continue'}<span>→</span></button></div>
+              <div className="register-step-actions">{registerStep > 1 && <button type="button" className="secondary-button" onClick={() => { setError(''); setRegisterStep((step) => step - 1); }}>Back</button>}<button type="submit" className="primary-button auth-submit" disabled={busy || (registerStep === 4 && !policiesAccepted) || (registerStep === 1 && ['checking', 'taken'].includes(codeAvailability))}>{busy ? registerStep === 1 ? 'Checking…' : 'Creating…' : registerStep === 4 ? 'Create account' : 'Continue'}<span>→</span></button></div>
             </form>
           </>}
           {screen !== 'welcome' && <p className="auth-mode-switch">{screen === 'login' ? 'New to FarazChat?' : 'Already registered?'} <button onClick={() => { setScreen(screen === 'login' ? 'register' : 'login'); setRegisterStep(1); setError(''); }}> {screen === 'login' ? 'Create account' : 'Log in'}</button></p>}
@@ -481,16 +658,79 @@ function StatusComposerModal({ token, onClose, onPublished }) {
   );
 }
 
-function StatusViewerModal({ token, update, onClose, onDelete }) {
-  const [index, setIndex] = useState(0);
+function StatusViewerModal({ token, update, onClose, onDelete, onOpenChat, initialStatusId }) {
+  const [index, setIndex] = useState(() => Math.max(0, update.statuses.findIndex((item) => item.id === initialStatusId)));
   const [error, setError] = useState('');
+  const [interactions, setInteractions] = useState(null);
+  const [commentDraft, setCommentDraft] = useState('');
+  const [savingInteraction, setSavingInteraction] = useState(false);
   const status = update.statuses[index];
   const canGoBack = index > 0;
   const canGoForward = index < update.statuses.length - 1;
 
   useEffect(() => {
-    if (status && !update.own) api(`/api/statuses/${status.id}/view`, token, { method: 'POST' }).catch(() => {});
+    if (!status) return undefined;
+    let active = true;
+    setInteractions(null);
+    setCommentDraft('');
+    setError('');
+    (async () => {
+      try {
+        if (!update.own) await api(`/api/statuses/${status.id}/view`, token, { method: 'POST' });
+        const result = await api(`/api/statuses/${status.id}/interactions`, token);
+        if (active) setInteractions(result);
+      } catch (requestError) {
+        if (active) setError(requestError.message);
+      }
+    })();
+    return () => { active = false; };
   }, [status?.id, token, update.own]);
+
+  async function toggleLike() {
+    if (!interactions) return;
+    setSavingInteraction(true);
+    setError('');
+    try {
+      const result = await api(`/api/statuses/${status.id}/like`, token, {
+        method: 'PUT',
+        body: JSON.stringify({ liked: !interactions.liked }),
+      });
+      setInteractions((current) => ({ ...current, ...result }));
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setSavingInteraction(false);
+    }
+  }
+
+  async function submitComment(event) {
+    event.preventDefault();
+    const body = commentDraft.trim();
+    if (!body || !interactions) return;
+    setSavingInteraction(true);
+    setError('');
+    try {
+      const result = await api(`/api/statuses/${status.id}/comments`, token, {
+        method: 'POST',
+        body: JSON.stringify({ body }),
+      });
+      setInteractions((current) => ({ ...current, comments: [...current.comments, result.comment] }));
+      setCommentDraft('');
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setSavingInteraction(false);
+    }
+  }
+
+  async function deleteComment(commentId) {
+    try {
+      await api(`/api/statuses/${status.id}/comments/${commentId}`, token, { method: 'DELETE' });
+      setInteractions((current) => ({ ...current, comments: current.comments.filter((comment) => comment.id !== commentId) }));
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
 
   async function deleteStatus() {
     try {
@@ -507,8 +747,33 @@ function StatusViewerModal({ token, update, onClose, onDelete }) {
         <header><Avatar name={update.user.display_name || update.user.username} src={update.user.avatar_url} /><span><strong>{update.own ? 'My status' : update.user.display_name || update.user.username}</strong><small>{new Date(status.created_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</small></span><button className="icon-button" onClick={onClose} aria-label="Close status"><X size={19} /></button></header>
         <div className="status-progress"><i style={{ width: `${((index + 1) / update.statuses.length) * 100}%` }} /></div>
         <main>{status.attachment && <AttachmentCard attachment={status.attachment} token={token} />}{status.body && <p>{status.body}</p>}</main>
-        <footer>{canGoBack && <button onClick={() => setIndex(index - 1)}>Previous</button>}<span>{index + 1} / {update.statuses.length}</span>{canGoForward && <button onClick={() => setIndex(index + 1)}>Next</button>}{update.own && <button className="status-delete" onClick={deleteStatus}>Delete</button>}</footer>
+        <section className="status-interactions" aria-label="Status interactions">
+          <div className="status-reaction-row"><button className={`status-like-button${interactions?.liked ? ' is-liked' : ''}`} onClick={toggleLike} disabled={!interactions || savingInteraction} aria-pressed={Boolean(interactions?.liked)}><Heart size={17} fill={interactions?.liked ? 'currentColor' : 'none'} />{interactions?.likes_count ?? status.likes_count ?? 0}</button><span className="status-view-count"><Eye size={16} />{interactions?.views_count ?? status.views_count ?? 0} views</span></div>
+          {update.own && interactions?.viewers.length > 0 && <div className="status-viewer-list"><strong>Seen by</strong>{interactions.viewers.map((viewer) => <span key={viewer.id}><Avatar name={viewer.display_name || viewer.username} src={viewer.avatar_url} />{viewer.display_name || viewer.username}</span>)}</div>}
+          <div className="status-comments"><strong>Comments {interactions ? `· ${interactions.comments.length}` : ''}</strong>{interactions?.comments.map((comment) => <div className="status-comment" key={comment.id}><button className="status-comment-avatar" type="button" onClick={() => onOpenChat(comment.user)} aria-label={`Open chat with ${comment.user.display_name || comment.user.username}`} title="Open personal chat"><Avatar name={comment.user.display_name || comment.user.username} src={comment.user.avatar_url} /></button><span><b>{comment.user.display_name || comment.user.username}</b><span>{comment.body}</span></span>{(comment.user.id === Number(update.user.id) || update.own) && <button className="status-comment-delete" onClick={() => deleteComment(comment.id)} aria-label="Delete comment"><X size={14} /></button>}</div>)}</div>
+          <form className="status-comment-form" onSubmit={submitComment}><input value={commentDraft} onChange={(event) => setCommentDraft(event.target.value)} placeholder="Reply to status…" maxLength={500} aria-label="Comment on status" disabled={!interactions || savingInteraction} /><button type="submit" disabled={!commentDraft.trim() || !interactions || savingInteraction} aria-label="Send comment"><Send size={16} /></button></form>
+        </section>
+        <footer>{canGoBack && <button onClick={() => setIndex(index - 1)}>Newer</button>}<span>{index + 1} / {update.statuses.length}</span>{canGoForward && <button onClick={() => setIndex(index + 1)}>Older</button>}{update.own && <button className="status-delete" onClick={deleteStatus}>Delete</button>}</footer>
         {error && <p className="form-error">{error}</p>}
+      </section>
+    </div>
+  );
+}
+
+function StatusActivityModal({ notifications, onClose, onOpenStatus }) {
+  return (
+    <div className="modal-scrim" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="contact-profile-modal status-activity-modal" role="dialog" aria-modal="true" aria-labelledby="status-activity-title">
+        <header className="modal-heading"><div><span className="modal-kicker">STATUS ACTIVITY</span><h2 id="status-activity-title">Recent activity</h2></div><button className="icon-button" onClick={onClose} aria-label="Close activity"><X size={19} /></button></header>
+        {notifications.length ? <div className="status-activity-list">{notifications.map((notification) => {
+          const actorName = notification.actor.display_name || notification.actor.username;
+          const action = notification.kind === 'view' ? 'viewed your status' : notification.kind === 'like' ? 'liked your status' : 'replied to your status';
+          return <button className={`status-activity-item${notification.read_at ? '' : ' is-unread'}`} key={notification.id} onClick={() => onOpenStatus(notification.status_id)}>
+            <Avatar name={actorName} src={notification.actor.avatar_url} />
+            <span className="status-activity-copy"><span><strong>{actorName}</strong> {action}</span>{notification.body && <small>“{notification.body}”</small>}<time>{new Date(notification.created_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</time></span>
+            <span className={`status-activity-kind status-activity-${notification.kind}`}>{notification.kind === 'view' ? <Eye size={16} /> : notification.kind === 'like' ? <Heart size={16} /> : <MessageCircle size={16} />}</span>
+          </button>;
+        })}</div> : <div className="status-activity-empty"><Bell size={22} /><strong>All caught up</strong><span>Status views, likes, and replies will show here.</span></div>}
       </section>
     </div>
   );
@@ -537,13 +802,12 @@ function GroupDetailsModal({ token, group, onClose }) {
   );
 }
 
-function SettingsModal({ token, user, initialSection, onClose, onSave, onSignOut }) {
+function SettingsModal({ token, user, initialSection, chatWallpaper, onWallpaperChange, theme, onThemeChange, onClose, onSave, onSignOut }) {
   const [section, setSection] = useState(initialSection);
   const [displayName, setDisplayName] = useState(user.display_name || user.username);
   const [bio, setBio] = useState(user.bio || '');
   const [notificationsEnabled, setNotificationsEnabled] = useState(Boolean(user.notifications_enabled));
   const [discoverable, setDiscoverable] = useState(user.discoverable !== false);
-  const [darkMode, setDarkMode] = useState(Boolean(user.dark_mode));
   const [photoPreview, setPhotoPreview] = useState(user.avatar_url || '');
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -557,11 +821,13 @@ function SettingsModal({ token, user, initialSection, onClose, onSave, onSignOut
     { id: 'privacy', label: 'Privacy', icon: Shield },
     { id: 'notifications', label: 'Notifications', icon: Bell },
     { id: 'appearance', label: 'Appearance', icon: Moon },
+    { id: 'wallpaper', label: 'Chat background', icon: ImagePlus },
     { id: 'account', label: 'Account', icon: KeyRound },
   ];
 
   async function requestNotifications(event) {
     const enabled = event.target.checked;
+    const previous = notificationsEnabled;
     setError('');
     if (enabled) {
       if (!('Notification' in window)) {
@@ -582,21 +848,86 @@ function SettingsModal({ token, user, initialSection, onClose, onSave, onSignOut
       }
     }
     setNotificationsEnabled(enabled);
+    if (!(await persistSettings({ notificationsEnabled: enabled }))) setNotificationsEnabled(previous);
   }
 
-  async function submit(event) {
-    event.preventDefault();
+  async function persistSettings(changes = {}, includeProfile = false) {
     setError('');
+    setNotice('');
     setBusy(true);
     try {
       const result = await api('/api/me', token, {
         method: 'PATCH',
-        body: JSON.stringify({ displayName, bio, notificationsEnabled, discoverable, darkMode }),
+        body: JSON.stringify({
+          displayName: includeProfile ? displayName : user.display_name || user.username,
+          bio: includeProfile ? bio : user.bio || '',
+          notificationsEnabled: changes.notificationsEnabled ?? notificationsEnabled,
+          discoverable: changes.discoverable ?? discoverable,
+        }),
       });
       onSave(result.user);
       setNotice('Settings saved.');
+      return true;
     } catch (requestError) {
       setError(requestError.message);
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submit(event) {
+    event.preventDefault();
+    await persistSettings({}, true);
+  }
+
+  async function changeDiscoverability(event) {
+    const nextValue = event.target.checked;
+    const previous = discoverable;
+    setDiscoverable(nextValue);
+    if (!(await persistSettings({ discoverable: nextValue }))) setDiscoverable(previous);
+  }
+
+  function chooseWallpaper(value) {
+    try {
+      localStorage.setItem(CHAT_WALLPAPER_KEY, value);
+      onWallpaperChange(value);
+      setNotice('Chat background updated.');
+      setError('');
+    } catch {
+      setError('Could not save this background on the device.');
+    }
+  }
+
+  function changeTheme(event) {
+    const nextTheme = event.target.checked ? 'dark' : 'light';
+    try {
+      localStorage.setItem(APP_THEME_KEY, nextTheme);
+      onThemeChange(nextTheme);
+      setNotice('Theme updated.');
+      setError('');
+    } catch {
+      setError('Could not save the theme on this device.');
+    }
+  }
+
+  async function selectWallpaperFile(event) {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    if (!file.type.startsWith('image/') || file.size > 12 * 1024 * 1024) {
+      setError('Choose an image that is 12 MB or smaller.');
+      return;
+    }
+    setError('');
+    setNotice('');
+    setBusy(true);
+    try {
+      const imageData = await compressWallpaper(file);
+      if (imageData.length > 4_000_000) throw new Error('Choose a smaller image.');
+      chooseWallpaper(imageData);
+    } catch (wallpaperError) {
+      setError(wallpaperError.message || 'Could not save that image.');
     } finally {
       setBusy(false);
     }
@@ -659,16 +990,17 @@ function SettingsModal({ token, user, initialSection, onClose, onSave, onSignOut
           {sections.map(({ id, label, icon: Icon }) => <button key={id} className={`settings-nav-item${section === id ? ' settings-nav-active' : ''}`} onClick={() => chooseSection(id)}><Icon size={17} /><span>{label}</span></button>)}
         </nav>
         <div className="settings-content">
-          <div className="settings-section-heading"><span className="modal-kicker">{sections.find((item) => item.id === section)?.label.toUpperCase()}</span><h3>{section === 'profile' ? 'Your profile' : section === 'privacy' ? 'Privacy' : section === 'notifications' ? 'Notifications' : section === 'appearance' ? 'Appearance' : 'Account security'}</h3></div>
+          <div className="settings-section-heading"><span className="modal-kicker">{sections.find((item) => item.id === section)?.label.toUpperCase()}</span><h3>{section === 'profile' ? 'Your profile' : section === 'privacy' ? 'Privacy' : section === 'notifications' ? 'Notifications' : section === 'appearance' ? 'Appearance' : section === 'wallpaper' ? 'Chat background' : 'Account security'}</h3></div>
           {section === 'profile' && <form className="settings-form" onSubmit={submit}>
             <label className="photo-picker" title="Change profile photo"><Avatar name={displayName || user.username} src={photoPreview} large /><span><Camera size={15} /> Change photo</span><input type="file" accept="image/jpeg,image/png,image/webp" onChange={selectPhoto} /></label>
             <div className="settings-field"><label htmlFor="edit-display-name">Profile name</label><input className="profile-input" id="edit-display-name" value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={40} required /></div>
             <div className="settings-field"><label htmlFor="edit-bio">Bio</label><textarea className="profile-textarea" id="edit-bio" value={bio} onChange={(event) => setBio(event.target.value)} placeholder="A little about you" maxLength={160} /><span className="bio-counter">{bio.length}/160</span></div>
             <button className="primary-button settings-save" disabled={busy}>{busy ? 'Saving…' : 'Save profile'}</button>
           </form>}
-          {section === 'privacy' && <div className="settings-panel"><div className="settings-row"><span className="setting-icon"><Search size={17} /></span><span className="notification-setting-copy"><strong>Find me by contact code</strong><span>{discoverable ? 'Other members can find you using your full 8-digit code.' : 'You will not appear in code search.'}</span></span><label className="switch-control" aria-label="Find me by contact code"><input type="checkbox" checked={discoverable} onChange={(event) => setDiscoverable(event.target.checked)} /><span className="switch-track" /></label></div><button className="primary-button settings-save" onClick={submit} disabled={busy}>{busy ? 'Saving…' : 'Save privacy settings'}</button></div>}
-          {section === 'notifications' && <div className="settings-panel"><div className="settings-row"><span className="setting-icon"><Bell size={17} /></span><span className="notification-setting-copy"><strong>Desktop message notifications</strong><span>Show alerts when the app is open but the conversation is not active. Browser permission is required.</span></span><label className="switch-control" aria-label="Message notifications"><input type="checkbox" checked={notificationsEnabled} onChange={requestNotifications} /><span className="switch-track" /></label></div><button className="primary-button settings-save" onClick={submit} disabled={busy}>{busy ? 'Saving…' : 'Save notification settings'}</button></div>}
-          {section === 'appearance' && <div className="settings-panel"><div className="settings-row"><span className="setting-icon"><Moon size={17} /></span><span className="notification-setting-copy"><strong>Dark mode</strong><span>Use a darker color scheme for the chat and settings.</span></span><label className="switch-control" aria-label="Dark mode"><input type="checkbox" checked={darkMode} onChange={(event) => setDarkMode(event.target.checked)} /><span className="switch-track" /></label></div><button className="primary-button settings-save" onClick={submit} disabled={busy}>{busy ? 'Saving…' : 'Save appearance'}</button></div>}
+          {section === 'privacy' && <div className="settings-panel"><div className="settings-row"><span className="setting-icon"><Search size={17} /></span><span className="notification-setting-copy"><strong>Find me by contact code</strong><span>{discoverable ? 'Other members can find you using your full 8-digit code.' : 'You will not appear in code search.'}</span></span><label className="switch-control" aria-label="Find me by contact code"><input type="checkbox" checked={discoverable} onChange={changeDiscoverability} disabled={busy} /><span className="switch-track" /></label></div></div>}
+          {section === 'notifications' && <div className="settings-panel"><div className="settings-row"><span className="setting-icon"><Bell size={17} /></span><span className="notification-setting-copy"><strong>Desktop message notifications</strong><span>Show alerts when the app is open but the conversation is not active. Browser permission is required.</span></span><label className="switch-control" aria-label="Message notifications"><input type="checkbox" checked={notificationsEnabled} onChange={requestNotifications} disabled={busy} /><span className="switch-track" /></label></div></div>}
+          {section === 'appearance' && <div className="settings-panel"><div className="settings-row"><span className="setting-icon"><Moon size={17} /></span><span className="notification-setting-copy"><strong>Dark theme</strong><span>Use the same theme across all accounts on this device.</span></span><label className="switch-control" aria-label="Dark theme"><input type="checkbox" checked={theme === 'dark'} onChange={changeTheme} /><span className="switch-track" /></label></div></div>}
+          {section === 'wallpaper' && <div className="wallpaper-settings"><div className="wallpaper-choices">{[{ id: 'paper', label: 'Soft paper' }, { id: 'grid', label: 'Fine grid' }, { id: 'sage', label: 'Sage dots' }].map((wallpaper) => <button key={wallpaper.id} type="button" className={`wallpaper-choice wallpaper-choice-${wallpaper.id}${chatWallpaper === wallpaper.id ? ' is-selected' : ''}`} onClick={() => chooseWallpaper(wallpaper.id)} aria-pressed={chatWallpaper === wallpaper.id}><span className="wallpaper-swatch" /><strong>{wallpaper.label}</strong></button>)}</div><div className="wallpaper-actions"><label className="photo-pick-button" title="Choose a chat background from your gallery"><ImagePlus size={15} /> Choose from gallery<input type="file" accept="image/*" onChange={selectWallpaperFile} disabled={busy} /></label>{chatWallpaper !== 'paper' && <button className="secondary-button" type="button" onClick={() => chooseWallpaper('paper')} disabled={busy}>Reset</button>}</div></div>}
           {section === 'account' && <div className="settings-panel"><div className="account-identity"><span className="setting-icon"><UserRound size={17} /></span><span className="notification-setting-copy"><strong>#{user.contact_code || user.username}</strong><span>Your contact code is how others find you.</span></span></div><form className="settings-form password-form" onSubmit={changePassword}><h4>Change password</h4><div className="settings-field"><label htmlFor="current-password">Current password</label><input className="profile-input" type="password" id="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" required /></div><div className="settings-field"><label htmlFor="new-password">New password</label><input className="profile-input" type="password" id="new-password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} minLength={8} maxLength={72} autoComplete="new-password" required /></div><button className="primary-button settings-save" disabled={busy}>{busy ? 'Updating…' : 'Update password'}</button></form>{confirmSignOut ? <div className="signout-confirm" role="alertdialog" aria-label="Confirm sign out"><strong>Sign out of this account?</strong><span>You can sign back in with your contact code and password.</span><div><button className="cancel-button" onClick={() => setConfirmSignOut(false)}>Cancel</button><button className="confirm-signout-button" onClick={onSignOut}>Sign out</button></div></div> : <button className="signout-button" onClick={() => setConfirmSignOut(true)}><LogOut size={16} /> Sign out</button>}</div>}
           {error && <p className="form-error settings-feedback" role="alert">{error}</p>}
           {notice && <p className="settings-success" role="status">{notice}</p>}
@@ -687,6 +1019,8 @@ function App() {
   const [contacts, setContacts] = useState([]);
   const [groups, setGroups] = useState([]);
   const [inboxView, setInboxView] = useState('chats');
+  const [chatWallpaper, setChatWallpaper] = useState(() => localStorage.getItem(CHAT_WALLPAPER_KEY) || 'paper');
+  const [theme, setTheme] = useState(() => localStorage.getItem(APP_THEME_KEY) === 'dark' ? 'dark' : 'light');
   const [statusUpdates, setStatusUpdates] = useState([]);
   const [active, setActive] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -696,6 +1030,9 @@ function App() {
   const [groupModalOpen, setGroupModalOpen] = useState(false);
   const [statusComposerOpen, setStatusComposerOpen] = useState(false);
   const [activeStatus, setActiveStatus] = useState(null);
+  const [activeStatusId, setActiveStatusId] = useState(null);
+  const [statusNotifications, setStatusNotifications] = useState([]);
+  const [activityOpen, setActivityOpen] = useState(false);
   const [groupDetailsOpen, setGroupDetailsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState('profile');
@@ -706,16 +1043,79 @@ function App() {
   const [contactTyping, setContactTyping] = useState(false);
   const [typingName, setTypingName] = useState('');
   const [selectedFile, setSelectedFile] = useState(null);
+  const [selectedWaveform, setSelectedWaveform] = useState([]);
+  const [isRecording, setIsRecording] = useState(false);
+  const [startingRecording, setStartingRecording] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const [recordingWaveform, setRecordingWaveform] = useState(() => compactWaveform([]));
+  const [cancelVoiceSwipe, setCancelVoiceSwipe] = useState(false);
   const [sendingMessage, setSendingMessage] = useState(false);
   const [error, setError] = useState('');
   const messageEndRef = useRef(null);
   const socketRef = useRef(null);
   const activeRef = useRef(active);
+  const mobileChatRef = useRef(mobileChat);
   const typingTimerRef = useRef(null);
   const photoInputRef = useRef(null);
   const fileInputRef = useRef(null);
+  const recorderRef = useRef(null);
+  const mediaStreamRef = useRef(null);
+  const recordingChunksRef = useRef([]);
+  const recordingSizeRef = useRef(0);
+  const recordingSamplesRef = useRef([]);
+  const waveformContextRef = useRef(null);
+  const waveformAnalyserRef = useRef(null);
+  const waveformTimerRef = useRef(null);
+  const cancelRecordingRef = useRef(false);
+  const sendVoiceOnStopRef = useRef(false);
+  const recordingPointerRef = useRef(null);
 
   useEffect(() => { activeRef.current = active; }, [active]);
+  useEffect(() => { mobileChatRef.current = mobileChat; }, [mobileChat]);
+
+  useEffect(() => {
+    function syncAccount(event) {
+      if (event.key === APP_THEME_KEY) {
+        setTheme(event.newValue === 'dark' ? 'dark' : 'light');
+        return;
+      }
+      if (event.key === CHAT_WALLPAPER_KEY) {
+        setChatWallpaper(event.newValue || 'paper');
+        return;
+      }
+      if (event.key !== TOKEN_KEY && event.key !== null) return;
+      if (event.key === null) {
+        setChatWallpaper('paper');
+        setTheme('light');
+      }
+      const nextToken = event.key === null ? null : event.newValue;
+      if (nextToken === token) return;
+      socketRef.current?.disconnect();
+      setLoading(Boolean(nextToken));
+      setToken(nextToken);
+      setUser(null);
+      setActive(null);
+      setMessages([]);
+      setConversations([]);
+      setContacts([]);
+      setGroups([]);
+      setStatusUpdates([]);
+      setStatusNotifications([]);
+      setActiveStatus(null);
+      setActiveStatusId(null);
+      setActivityOpen(false);
+      setSettingsOpen(false);
+      setError('');
+    }
+    window.addEventListener('storage', syncAccount);
+    return () => window.removeEventListener('storage', syncAccount);
+  }, [token]);
+
+  useEffect(() => {
+    if (!isRecording) { setRecordingSeconds(0); return undefined; }
+    const timer = setInterval(() => setRecordingSeconds((seconds) => seconds + 1), 1000);
+    return () => clearInterval(timer);
+  }, [isRecording]);
 
   useEffect(() => {
     if (!token) { setLoading(false); return; }
@@ -742,18 +1142,66 @@ function App() {
   }
 
   async function loadStatuses() {
-    if (!token) return;
+    if (!token) return [];
     const result = await api('/api/statuses', token);
     setStatusUpdates(result.updates);
+    return result.updates;
+  }
+
+  async function loadStatusNotifications() {
+    if (!token) return null;
+    const result = await api('/api/status-notifications', token);
+    setStatusNotifications((current) => {
+      const merged = new Map(current.map((notification) => [notification.id, notification]));
+      result.notifications.forEach((notification) => {
+        const currentNotification = merged.get(notification.id);
+        merged.set(notification.id, currentNotification?.read_at ? currentNotification : notification);
+      });
+      return [...merged.values()].sort((left, right) => right.id - left.id).slice(0, 100);
+    });
+    return result;
+  }
+
+  async function openStatusActivity() {
+    setActivityOpen(true);
+    try {
+      const result = await loadStatusNotifications();
+      if (result?.unread_count) {
+        await api('/api/status-notifications/read', token, { method: 'POST', body: JSON.stringify({}) });
+        const readAt = Date.now();
+        setStatusNotifications((current) => current.map((notification) => ({ ...notification, read_at: notification.read_at || readAt })));
+      }
+    } catch (loadError) {
+      setError(loadError.message);
+    }
+  }
+
+  async function openNotifiedStatus(statusId) {
+    try {
+      const updates = statusUpdates.some((update) => update.own && update.statuses.some((status) => status.id === statusId))
+        ? statusUpdates
+        : await loadStatuses();
+      const ownStatus = updates.find((update) => update.own && update.statuses.some((status) => status.id === statusId));
+      if (!ownStatus) throw new Error('That status has expired.');
+      setActivityOpen(false);
+      setActiveStatus(ownStatus);
+      setActiveStatusId(statusId);
+    } catch (openError) {
+      setError(openError.message);
+    }
   }
 
   useEffect(() => {
     if (!token || !user) return;
     let alive = true;
     loadConversations().catch((loadError) => { if (alive) setError(loadError.message); });
+    loadStatusNotifications().catch((loadError) => { if (alive) setError(loadError.message); });
     const socket = io(apiBaseUrl || undefined, { auth: { token } });
     socketRef.current = socket;
-    socket.on('connect', () => setSocketReady(true));
+    socket.on('connect', () => {
+      setSocketReady(true);
+      loadStatusNotifications().catch(() => {});
+    });
     socket.on('disconnect', () => setSocketReady(false));
     socket.on('presence:sync', (userIds) => setOnlineUsers(new Set(userIds)));
     socket.on('presence:update', ({ userId, online }) => {
@@ -786,6 +1234,13 @@ function App() {
         : !message.group_id && selected?.id === (message.sender_id === user.id ? message.recipient_id : message.sender_id);
       if (matches) {
         setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
+        const chatIsVisible = !document.hidden && (window.innerWidth > 760 || mobileChatRef.current);
+        if (chatIsVisible && message.sender_id !== user.id) {
+          const readBody = selected.kind === 'group'
+            ? { groupId: selected.id }
+            : { otherUserId: selected.id };
+          api('/api/messages/read', token, { method: 'POST', body: JSON.stringify(readBody) }).catch(() => {});
+        }
       }
       if (message.sender_id !== user.id && user.notifications_enabled
         && (document.hidden || activeRef.current?.id !== message.sender_id)
@@ -797,10 +1252,40 @@ function App() {
       }
       loadConversations().catch(() => {});
     });
+    socket.on('messages:read', ({ messageIds, groupId }) => {
+      const readIds = new Set(messageIds);
+      setMessages((current) => current.map((message) => {
+        if (!readIds.has(message.id)) return message;
+        const readCount = Math.min(message.recipient_count || 1, (message.read_count || 0) + 1);
+        const deliveredCount = Math.max(message.delivered_count || 0, readCount);
+        return {
+          ...message,
+          read_count: readCount,
+          delivered_count: deliveredCount,
+          is_delivered: groupId ? deliveredCount >= (message.recipient_count || 1) : true,
+          is_read: groupId ? readCount >= (message.recipient_count || 1) : true,
+        };
+      }));
+    });
+    socket.on('messages:delivered', ({ messageIds, groupId }) => {
+      const deliveredIds = new Set(messageIds);
+      setMessages((current) => current.map((message) => {
+        if (!deliveredIds.has(message.id)) return message;
+        const deliveredCount = Math.min(message.recipient_count || 1, (message.delivered_count || 0) + 1);
+        return {
+          ...message,
+          delivered_count: deliveredCount,
+          is_delivered: groupId ? deliveredCount >= (message.recipient_count || 1) : true,
+        };
+      }));
+    });
     socket.on('group:created', (group) => {
       setGroups((current) => current.some((item) => item.id === group.id) ? current : [group, ...current]);
     });
     socket.on('status:new', () => loadStatuses().catch(() => {}));
+    socket.on('status:notification', (notification) => {
+      setStatusNotifications((current) => [notification, ...current.filter((item) => item.id !== notification.id)].slice(0, 100));
+    });
     return () => {
       alive = false;
       socket.disconnect();
@@ -841,6 +1326,7 @@ function App() {
     localStorage.removeItem(TOKEN_KEY);
     socketRef.current?.disconnect();
     setToken(null); setUser(null); setActive(null); setConversations([]); setGroups([]); setMessages([]); setStatusUpdates([]); setSettingsOpen(false);
+    setStatusNotifications([]); setActiveStatus(null); setActiveStatusId(null); setActivityOpen(false);
   }
 
   function openSettings(section = 'profile') {
@@ -891,6 +1377,7 @@ function App() {
     setContactTyping(false);
     setTypingName('');
     setSelectedFile(null);
+    setSelectedWaveform([]);
     setError('');
     if (!conversations.some((conversation) => conversation.id === person.id)) {
       setConversations((current) => [person, ...current]);
@@ -905,6 +1392,7 @@ function App() {
     setContactTyping(false);
     setTypingName('');
     setSelectedFile(null);
+    setSelectedWaveform([]);
     setError('');
   }
 
@@ -926,6 +1414,7 @@ function App() {
       statuses: update.statuses.filter((status) => status.id !== statusId),
     })).filter((update) => update.statuses.length > 0));
     setActiveStatus(null);
+    setActiveStatusId(null);
   }
 
   function updateDraft(value) {
@@ -951,19 +1440,182 @@ function App() {
     }
     setError('');
     setSelectedFile(file);
+    setSelectedWaveform([]);
   }
 
-  async function sendMessage(event) {
+  async function startVoiceRecording() {
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      setError('Voice recording is not supported by this browser.');
+      return;
+    }
+    setStartingRecording(true);
+    setError('');
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg;codecs=opus']
+        .find((type) => MediaRecorder.isTypeSupported?.(type));
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      recordingChunksRef.current = [];
+      recordingSizeRef.current = 0;
+      recordingSamplesRef.current = [];
+      setRecordingWaveform(compactWaveform([]));
+      cancelRecordingRef.current = false;
+      mediaStreamRef.current = stream;
+      recorderRef.current = recorder;
+      try {
+        const AudioContextType = window.AudioContext || window.webkitAudioContext;
+        if (AudioContextType) {
+          const audioContext = new AudioContextType();
+          waveformContextRef.current = audioContext;
+          await audioContext.resume();
+          const analyser = audioContext.createAnalyser();
+          analyser.fftSize = 256;
+          audioContext.createMediaStreamSource(stream).connect(analyser);
+          waveformAnalyserRef.current = analyser;
+          const sampleBuffer = new Uint8Array(analyser.fftSize);
+          waveformTimerRef.current = setInterval(() => {
+            analyser.getByteTimeDomainData(sampleBuffer);
+            let peak = 0;
+            for (const sample of sampleBuffer) peak = Math.max(peak, Math.abs(sample - 128) / 128);
+            recordingSamplesRef.current.push(Math.min(1, peak * 3));
+            setRecordingWaveform(compactWaveform(recordingSamplesRef.current));
+          }, 100);
+        }
+      } catch {
+        waveformContextRef.current?.close().catch(() => {});
+        waveformContextRef.current = null;
+        waveformAnalyserRef.current = null;
+      }
+      recorder.ondataavailable = (event) => {
+        if (!event.data.size) return;
+        recordingSizeRef.current += event.data.size;
+        if (recordingSizeRef.current > 15 * 1024 * 1024) {
+          cancelRecordingRef.current = true;
+          sendVoiceOnStopRef.current = false;
+          setError('Voice notes must be 15 MB or smaller.');
+          setIsRecording(false);
+          if (recorder.state !== 'inactive') recorder.stop();
+          return;
+        }
+        recordingChunksRef.current.push(event.data);
+      };
+      recorder.onerror = () => {
+        cancelRecordingRef.current = true;
+        setError('Voice recording stopped unexpectedly. Please try again.');
+        setIsRecording(false);
+      };
+      recorder.onstop = () => {
+        clearInterval(waveformTimerRef.current);
+        waveformTimerRef.current = null;
+        waveformAnalyserRef.current = null;
+        waveformContextRef.current?.close().catch(() => {});
+        waveformContextRef.current = null;
+        stream.getTracks().forEach((track) => track.stop());
+        mediaStreamRef.current = null;
+        recorderRef.current = null;
+        recordingPointerRef.current = null;
+        setCancelVoiceSwipe(false);
+        setIsRecording(false);
+        if (cancelRecordingRef.current) {
+          cancelRecordingRef.current = false;
+          recordingChunksRef.current = [];
+          recordingSamplesRef.current = [];
+          setRecordingWaveform(compactWaveform([]));
+          return;
+        }
+        const type = recorder.mimeType || recordingChunksRef.current[0]?.type || 'audio/webm';
+        const blob = new Blob(recordingChunksRef.current, { type });
+        recordingChunksRef.current = [];
+        if (!blob.size) {
+          setError('No audio was recorded. Try recording again.');
+          return;
+        }
+        const extension = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm';
+        const voiceNote = new File([blob], `voice-note-${Date.now()}.${extension}`, { type });
+        const waveform = compactWaveform(recordingSamplesRef.current);
+        recordingSamplesRef.current = [];
+        setError('');
+        if (sendVoiceOnStopRef.current) {
+          sendVoiceOnStopRef.current = false;
+          sendMessageContent('', voiceNote, waveform);
+        } else {
+          setSelectedFile(voiceNote);
+          setSelectedWaveform(waveform);
+        }
+      };
+      recorder.start(1000);
+      setIsRecording(true);
+      if (recordingPointerRef.current?.released) {
+        const pointerState = recordingPointerRef.current;
+        recordingPointerRef.current = null;
+        cancelRecordingRef.current = pointerState.cancelled;
+        sendVoiceOnStopRef.current = !pointerState.cancelled;
+        recorder.stop();
+      }
+    } catch (recordingError) {
+      stream?.getTracks().forEach((track) => track.stop());
+      recordingPointerRef.current = null;
+      setError(recordingError.name === 'NotAllowedError' || recordingError.name === 'PermissionDeniedError'
+        ? 'Allow microphone access to record a voice note.'
+        : 'Could not start voice recording. Check your microphone and try again.');
+    } finally {
+      setStartingRecording(false);
+    }
+  }
+
+  function stopVoiceRecording(discard = false, send = false) {
+    const recorder = recorderRef.current;
+    if (!recorder || recorder.state === 'inactive') return;
+    cancelRecordingRef.current = discard;
+    sendVoiceOnStopRef.current = send && !discard;
+    if (discard) setError('');
+    recorder.stop();
+    setIsRecording(false);
+  }
+
+  function beginVoicePress(event) {
+    if (event.button !== 0 || startingRecording || sendingMessage || selectedFile) return;
     event.preventDefault();
-    const body = draft.trim();
-    if ((!body && !selectedFile) || !active || sendingMessage) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    recordingPointerRef.current = { id: event.pointerId, startX: event.clientX, cancelled: false, released: false };
+    startVoiceRecording();
+  }
+
+  function moveVoicePress(event) {
+    const pointerState = recordingPointerRef.current;
+    if (!pointerState || pointerState.id !== event.pointerId) return;
+    pointerState.cancelled = event.clientX < pointerState.startX - 72;
+    setCancelVoiceSwipe(pointerState.cancelled);
+  }
+
+  function endVoicePress(event, cancelled = false) {
+    const pointerState = recordingPointerRef.current;
+    if (!pointerState || pointerState.id !== event.pointerId) return;
+    pointerState.released = true;
+    pointerState.cancelled ||= cancelled || event.clientX < pointerState.startX - 72;
+    const recorder = recorderRef.current;
+    if (!recorder || recorder.state === 'inactive') return;
+    recordingPointerRef.current = null;
+    cancelRecordingRef.current = pointerState.cancelled;
+    sendVoiceOnStopRef.current = !pointerState.cancelled;
+    setCancelVoiceSwipe(false);
+    recorder.stop();
+    setIsRecording(false);
+  }
+
+  async function sendMessageContent(body, attachment, waveform = []) {
+    if ((!body && !attachment) || !active || sendingMessage) return;
     setDraft('');
     setSendingMessage(true);
     clearTimeout(typingTimerRef.current);
     emitTyping(active, false);
     const formData = new FormData();
     formData.append('body', body);
-    if (selectedFile) formData.append('file', selectedFile);
+    if (attachment) {
+      formData.append('file', attachment);
+      if (attachment.type.startsWith('audio/') && waveform.length) formData.append('waveform', JSON.stringify(waveform));
+    }
     try {
       const messagePath = active.kind === 'group'
         ? `/api/groups/${active.id}/messages`
@@ -975,28 +1627,40 @@ function App() {
       });
       setMessages((current) => current.some((message) => message.id === result.message.id) ? current : [...current, result.message]);
       setSelectedFile(null);
+      setSelectedWaveform([]);
       await loadConversations();
     } catch (sendError) {
       setDraft(body);
+      if (attachment) {
+        setSelectedFile(attachment);
+        setSelectedWaveform(waveform);
+      }
       setError(sendError.message);
     } finally {
       setSendingMessage(false);
     }
   }
 
+  function sendMessage(event) {
+    event.preventDefault();
+    sendMessageContent(draft.trim(), selectedFile, selectedWaveform);
+  }
+
   const filteredConversations = conversations.filter((conversation) =>
     `${conversation.display_name || ''} ${conversation.username}`.toLowerCase().includes(filter.toLowerCase()));
   const filteredGroups = groups.filter((group) => group.name.toLowerCase().includes(filter.toLowerCase()));
+  const customChatWallpaper = chatWallpaper.startsWith('data:image/jpeg;base64,');
+  const wallpaperPreset = ['paper', 'grid', 'sage'].includes(chatWallpaper) ? chatWallpaper : 'paper';
 
   if (loading) return <main className="loading-screen"><div className="loading-mark"><MessageCircle size={23} /></div><span>Opening your chats…</span></main>;
   if (!user) return <AuthScreen onLogin={handleLogin} />;
 
   return (
-    <main className="messenger-shell" data-theme={user.dark_mode ? 'dark' : 'light'}>
+    <main className="messenger-shell" data-theme={theme}>
       <aside className={`sidebar${mobileChat ? ' sidebar-hidden-mobile' : ''}`}>
         <header className="sidebar-header">
           <a className="brand app-brand" href="#"><img className="brand-mark-image" src="/farazchat-mark.svg" alt="" /><span>Faraz<span className="brand-light">Chat</span></span></a>
-          <div className="header-actions"><span className={`connection-indicator${socketReady ? ' is-online' : ''}`} title={socketReady ? 'Connected' : 'Connecting'} /><button className="icon-button add-button" onClick={() => setModalOpen(true)} aria-label="New chat" title="New chat"><Plus size={21} /></button><button className="icon-button group-create-button" onClick={() => setGroupModalOpen(true)} aria-label="Create group" title="Create group"><UsersRound size={18} /></button><button className="icon-button settings-button" onClick={() => openSettings('profile')} aria-label="Settings" title="Settings"><Settings size={18} /></button></div>
+          <div className="header-actions"><span className={`connection-indicator${socketReady ? ' is-online' : ''}`} title={socketReady ? 'Connected' : 'Connecting'} /><button className="icon-button activity-button" onClick={openStatusActivity} aria-label="Status activity" title="Status activity"><Bell size={18} />{statusNotifications.some((notification) => !notification.read_at) && <i>{statusNotifications.filter((notification) => !notification.read_at).length}</i>}</button><button className="icon-button add-button" onClick={() => setModalOpen(true)} aria-label="New chat" title="New chat"><Plus size={21} /></button><button className="icon-button group-create-button" onClick={() => setGroupModalOpen(true)} aria-label="Create group" title="Create group"><UsersRound size={18} /></button><button className="icon-button settings-button" onClick={() => openSettings('profile')} aria-label="Settings" title="Settings"><Settings size={18} /></button></div>
         </header>
         <div className="inbox-title-row"><div><span className="inbox-kicker">YOUR SPACE</span><h1>Messages <span>{conversations.length || ''}</span></h1></div><button className="text-new-chat" onClick={() => setModalOpen(true)}><Plus size={15} /> New chat</button></div>
         <nav className="inbox-tabs" aria-label="Inbox views">
@@ -1011,7 +1675,7 @@ function App() {
             <span className="conversation-copy"><span className="conversation-top"><strong>{conversation.display_name || conversation.username}</strong><time>{relativeTime(conversation.last_message_at)}</time></span><span className="conversation-bottom"><span>{conversation.last_message || `#${conversation.contact_code || conversation.username}`}</span>{onlineUsers.has(conversation.id) && <i className="conversation-online-label">Online</i>}</span></span>
           </button>)}
           {inboxView === 'groups' && filteredGroups.map((group) => <button key={group.id} className={`conversation-item group-conversation${active?.kind === 'group' && active.id === group.id ? ' conversation-active' : ''}`} onClick={() => chooseGroup(group)}><span className="group-avatar"><UsersRound size={18} /></span><span className="conversation-copy"><span className="conversation-top"><strong>{group.name}</strong><time>{relativeTime(group.last_message_at)}</time></span><span className="conversation-bottom"><span>{group.last_message || `${group.member_count} members`}</span></span></span></button>)}
-          {inboxView === 'status' && <div className="status-list"><button className="status-list-item my-status-item" onClick={() => { const ownStatus = statusUpdates.find((update) => update.own); if (ownStatus) setActiveStatus(ownStatus); else setStatusComposerOpen(true); }}><span className="status-ring status-add-ring"><Avatar name={user.display_name || user.username} src={user.avatar_url} /><i>+</i></span><span><strong>My status</strong><small>{statusUpdates.find((update) => update.own)?.statuses.length ? `${statusUpdates.find((update) => update.own).statuses.length} updates · tap to view` : 'Share a photo or update'}</small></span><span className="status-add-control" aria-hidden="true"><Plus size={17} /></span></button>{statusUpdates.filter((update) => !update.own).map((update) => <button className="status-list-item" key={update.user.id} onClick={() => setActiveStatus(update)}><span className={`status-ring${update.statuses.some((status) => !status.viewed) ? ' status-unviewed' : ''}`}><Avatar name={update.user.display_name || update.user.username} src={update.user.avatar_url} /></span><span><strong>{update.user.display_name || update.user.username}</strong><small>{update.statuses.length} update{update.statuses.length === 1 ? '' : 's'} · {relativeTime(new Date(update.statuses.at(-1).created_at).toISOString().slice(0, 19).replace('T', ' '))}</small></span></button>)}</div>}
+          {inboxView === 'status' && <div className="status-list"><button className="status-list-item my-status-item" onClick={() => { const ownStatus = statusUpdates.find((update) => update.own); if (ownStatus) { setActiveStatus(ownStatus); setActiveStatusId(null); } else setStatusComposerOpen(true); }}><span className="status-ring status-add-ring"><Avatar name={user.display_name || user.username} src={user.avatar_url} /><i>+</i></span><span><strong>My status</strong><small>{statusUpdates.find((update) => update.own)?.statuses.length ? `${statusUpdates.find((update) => update.own).statuses.length} updates · tap to view` : 'Share a photo or update'}</small></span><span className="status-add-control" aria-hidden="true"><Plus size={17} /></span></button>{statusUpdates.filter((update) => !update.own).map((update) => <button className="status-list-item" key={update.user.id} onClick={() => { setActiveStatus(update); setActiveStatusId(null); }}><span className={`status-ring${update.statuses.some((status) => !status.viewed) ? ' status-unviewed' : ''}`}><Avatar name={update.user.display_name || update.user.username} src={update.user.avatar_url} /></span><span><strong>{update.user.display_name || update.user.username}</strong><small>{update.statuses.length} update{update.statuses.length === 1 ? '' : 's'} · {relativeTime(new Date(update.statuses[0].created_at).toISOString().slice(0, 19).replace('T', ' '))}</small></span></button>)}</div>}
           {inboxView === 'chats' && filteredConversations.length === 0 && <div className="inbox-empty"><span className="empty-art"><MessageCircle size={24} /></span><strong>{filter ? 'No matches' : 'A little quiet here'}</strong><span>{filter ? 'Try a different name.' : 'Start a conversation with someone.'}</span>{!filter && <button onClick={() => setModalOpen(true)}>Find someone <span>↗</span></button>}</div>}
           {inboxView === 'groups' && filteredGroups.length === 0 && <div className="inbox-empty"><span className="empty-art"><UsersRound size={24} /></span><strong>{filter ? 'No matches' : 'No groups yet'}</strong><span>{filter ? 'Try another group name.' : 'Bring people together in a group.'}</span>{!filter && <button onClick={() => setGroupModalOpen(true)}>Create group <span>↗</span></button>}</div>}
         </div>
@@ -1020,31 +1684,35 @@ function App() {
 
       <section className={`chat-panel${mobileChat ? ' chat-mobile-visible' : ''}`}>
         {active ? <>
-          <header className="chat-header"><button className="icon-button back-button" onClick={() => setMobileChat(false)} aria-label="Back to messages"><ArrowLeft size={19} /></button><button className="contact-profile-trigger" onClick={() => active.kind === 'group' ? setGroupDetailsOpen(true) : setContactProfileOpen(true)}><span className={active.kind === 'group' ? 'group-avatar chat-group-avatar' : ''}>{active.kind === 'group' ? <UsersRound size={19} /> : <Avatar name={active.display_name || active.username} src={active.avatar_url} />}</span><span className="chat-contact"><strong>{active.display_name || active.name || active.username}</strong><span className={`contact-status${active.kind !== 'group' && onlineUsers.has(active.id) ? ' is-online' : ''}`}><i />{contactTyping ? <>{typingName && `${typingName} `}typing<span className="typing-dots" aria-hidden="true"><i /><i /><i /></span></> : active.kind === 'group' ? `${active.member_count || active.members?.length || 0} members` : <>{onlineUsers.has(active.id) ? 'Online' : 'Offline'} · #{active.contact_code || active.username}</>}</span></span></button></header>
-          <div className="message-stage">
+          <header className="chat-header"><button className="icon-button back-button" onClick={() => setMobileChat(false)} aria-label="Back to messages"><ArrowLeft size={19} /></button><button className="contact-profile-trigger" onClick={() => active.kind === 'group' ? setGroupDetailsOpen(true) : setContactProfileOpen(true)}><span className={active.kind === 'group' ? 'group-avatar chat-group-avatar' : ''}>{active.kind === 'group' ? <UsersRound size={19} /> : <Avatar name={active.display_name || active.username} src={active.avatar_url} />}</span><span className="chat-contact"><strong>{active.display_name || active.name || active.username}</strong><span className={`contact-status${active.kind !== 'group' && onlineUsers.has(active.id) ? ' is-online' : ''}`}><i />{contactTyping ? <>{typingName && `${typingName} `}typing<span className="typing-dots" aria-hidden="true"><i /><i /><i /></span></> : active.kind === 'group' ? `${active.member_count || active.members?.length || 0} members` : <>{onlineUsers.has(active.id) ? 'Online' : 'Offline'} · #{active.contact_code || active.username}</>}</span></span></button><button className="icon-button activity-button chat-activity-button" onClick={openStatusActivity} aria-label="Status activity" title="Status activity"><Bell size={18} />{statusNotifications.some((notification) => !notification.read_at) && <i>{statusNotifications.filter((notification) => !notification.read_at).length}</i>}</button><button className="chat-own-account" onClick={() => openSettings('profile')} aria-label={`Signed in as ${user.display_name || user.username}, code ${user.contact_code || user.username}`} title={`Signed in as ${user.display_name || user.username} · #${user.contact_code || user.username}`}><Avatar name={user.display_name || user.username} src={user.avatar_url} /><span><strong>{user.display_name || user.username}</strong><small>#{user.contact_code || user.username}</small></span></button></header>
+          <div className={`message-stage wallpaper-${customChatWallpaper ? 'custom' : wallpaperPreset}`} style={customChatWallpaper ? { '--chat-wallpaper-image': `url("${chatWallpaper}")` } : undefined}>
             <div className="message-date"><span>YOUR CONVERSATION</span></div>
             {messages.length === 0 && <div className="first-message"><Avatar name={active.kind === 'group' ? active.name : active.display_name || active.username} src={active.avatar_url} large /><strong>{active.kind === 'group' ? active.name : `You and ${active.display_name || active.username}`}</strong><span>{active.kind === 'group' ? 'Your group conversation starts here.' : 'This is the beginning of your conversation.'}</span><span className="first-message-rule" /></div>}
             {messages.map((message, index) => {
               const mine = message.sender_id === user.id;
+              const messageSeen = active.kind === 'group' ? message.read_count > 0 : message.is_read;
+              const messageDelivered = message.is_delivered || messageSeen || (active.kind === 'group' && message.delivered_count > 0);
               const previous = messages[index - 1];
               const showAuthor = !previous || previous.sender_id !== message.sender_id;
               return <div className={`message-row${mine ? ' message-mine' : ''}${showAuthor ? ' message-first' : ''}`} key={message.id}>
                 {!mine && showAuthor && <Avatar name={active.kind === 'group' ? message.sender_display_name || message.sender_username : active.display_name || active.username} src={active.kind === 'group' ? '' : active.avatar_url} />}
-                <div className="message-stack">{active.kind === 'group' && showAuthor && !mine && <span className="group-message-author">{message.sender_display_name || message.sender_username}</span>}{message.body && <div className="message-bubble">{message.body}</div>}{message.attachment && <AttachmentCard attachment={message.attachment} token={token} />}<span className="message-time">{relativeTime(message.created_at)}</span></div>
+                <div className="message-stack">{active.kind === 'group' && showAuthor && !mine && <span className="group-message-author">{message.sender_display_name || message.sender_username}</span>}{message.body && <div className="message-bubble">{message.body}</div>}{message.attachment && <AttachmentCard attachment={message.attachment} token={token} />}<span className="message-time">{relativeTime(message.created_at)}{mine && <span className={`message-read-receipt${messageSeen ? ' is-read' : messageDelivered ? ' is-delivered' : ''}`} title={active.kind === 'group' ? `${message.delivered_count || 0} delivered · ${message.read_count || 0} seen` : messageSeen ? 'Seen' : messageDelivered ? 'Delivered' : 'Sent'}>{active.kind === 'group' && message.read_count > 0 && <small>{message.read_count}/{message.recipient_count}</small>}{messageSeen || messageDelivered ? <CheckCheck size={14} /> : <Check size={13} />}</span>}</span></div>
               </div>;
             })}
             <div ref={messageEndRef} />
           </div>
           {error && <div className="chat-error" role="alert">{error}<button onClick={() => setError('')} aria-label="Dismiss"><X size={14} /></button></div>}
           {selectedFile && <div className="attachment-draft"><FileText size={17} /><span><strong>{selectedFile.name}</strong><small>{formatFileSize(selectedFile.size)}</small></span><button className="icon-button" onClick={() => setSelectedFile(null)} type="button" aria-label="Remove attachment"><X size={15} /></button></div>}
+          {(isRecording || startingRecording) && <div className={`voice-recording-status${cancelVoiceSwipe ? ' voice-cancel-pending' : ''}`} role="status"><span className="voice-recording-dot" />{startingRecording ? 'Waiting for microphone…' : `Recording ${String(Math.floor(recordingSeconds / 60)).padStart(2, '0')}:${String(recordingSeconds % 60).padStart(2, '0')}`}<span className="recording-waveform" aria-label="Live voice waveform">{recordingWaveform.slice(-36).map((amplitude, index) => <i key={index} style={{ height: `${Math.round(20 + amplitude * 80)}%` }} />)}</span><span className="voice-recording-hint">{cancelVoiceSwipe ? 'Release to cancel' : 'Release to send · slide left to cancel'}</span>{isRecording && <><button type="button" onClick={() => stopVoiceRecording(false, true)}>Send now</button><button type="button" onClick={() => stopVoiceRecording(true)}>Cancel</button></>}</div>}
+                    {selectedFile && <div className="attachment-draft"><FileText size={17} /><span><strong>{selectedFile.name}</strong><small>{formatFileSize(selectedFile.size)}</small></span><button className="icon-button" onClick={() => { setSelectedFile(null); setSelectedWaveform([]); }} type="button" aria-label="Remove attachment"><X size={15} /></button></div>}
           <form className="composer" onSubmit={sendMessage}>
             <input ref={photoInputRef} className="hidden-file-input" type="file" accept="image/*,video/*" onChange={selectAttachment} />
             <input ref={fileInputRef} className="hidden-file-input" type="file" onChange={selectAttachment} />
-            <button className="composer-tool" type="button" onClick={() => photoInputRef.current?.click()} aria-label="Add photo or video" title="Add photo or video"><ImagePlus size={19} /></button>
-            <button className="composer-tool" type="button" onClick={() => fileInputRef.current?.click()} aria-label="Attach file" title="Attach file"><Paperclip size={18} /></button>
-            <input value={draft} onChange={(event) => updateDraft(event.target.value)} placeholder={`Message ${active.kind === 'group' ? active.name : active.display_name || active.username}…`} maxLength={4000} aria-label="Message" />
+            <button className="composer-tool" type="button" onClick={() => photoInputRef.current?.click()} aria-label="Add photo or video" title="Add photo or video" disabled={isRecording || sendingMessage}><ImagePlus size={19} /></button>
+            <button className="composer-tool" type="button" onClick={() => fileInputRef.current?.click()} aria-label="Attach file" title="Attach file" disabled={isRecording || sendingMessage}><Paperclip size={18} /></button>
+            <input value={draft} onChange={(event) => updateDraft(event.target.value)} placeholder={`Message ${active.kind === 'group' ? active.name : active.display_name || active.username}…`} maxLength={4000} aria-label="Message" disabled={isRecording || startingRecording} />
             <span className="composer-divider" />
-            <button type="submit" className="send-button" disabled={(!draft.trim() && !selectedFile) || sendingMessage} aria-label="Send message" title="Send message"><Send size={17} /></button>
+            {draft.trim() || selectedFile ? <button type="submit" className="send-button" disabled={sendingMessage || isRecording} aria-label="Send message" title="Send message"><Send size={17} /></button> : <button className={`composer-tool voice-record-button${isRecording ? ' voice-recording' : ''}`} type="button" onPointerDown={beginVoicePress} onPointerMove={moveVoicePress} onPointerUp={endVoicePress} onPointerCancel={(event) => endVoicePress(event, true)} onClick={(event) => { if (event.detail === 0 && !isRecording) startVoiceRecording(); }} disabled={sendingMessage} aria-label="Hold to record voice note" title="Hold to record; release to send"><Mic size={18} /></button>}
           </form>
           <div className="chat-privacy"><LockKeyhole size={12} /> Messages are stored on your FarazChat server.</div>
         </> : <div className="welcome-panel"><div className="welcome-illustration"><div className="welcome-orbit orbit-one" /><div className="welcome-orbit orbit-two" /><span className="welcome-icon"><MessageCircle size={35} /></span><span className="orbit-dot dot-one" /><span className="orbit-dot dot-two" /><span className="orbit-dot dot-three" /></div><span className="welcome-eyebrow">A SPACE OF YOUR OWN</span><h2>Make room for<br />a good <span>conversation.</span></h2><p>Choose someone you know, or find a new face by their username.</p><button className="primary-button welcome-button" onClick={() => setModalOpen(true)}><Plus size={17} /> Start a new chat</button><span className="welcome-bottom"><Check size={14} /> Your messages, delivered in real time</span></div>}
@@ -1052,9 +1720,10 @@ function App() {
       {modalOpen && <NewChatModal token={token} onClose={() => setModalOpen(false)} onSelect={chooseConversation} />}
       {groupModalOpen && <GroupModal token={token} onClose={() => setGroupModalOpen(false)} onCreate={handleGroupCreated} />}
       {statusComposerOpen && <StatusComposerModal token={token} onClose={() => setStatusComposerOpen(false)} onPublished={publishStatus} />}
-      {activeStatus && <StatusViewerModal token={token} update={activeStatus} onClose={() => setActiveStatus(null)} onDelete={removeStatus} />}
+      {activityOpen && <StatusActivityModal notifications={statusNotifications} onClose={() => setActivityOpen(false)} onOpenStatus={openNotifiedStatus} />}
+      {activeStatus && <StatusViewerModal key={`${activeStatus.user.id}-${activeStatusId || activeStatus.statuses[0]?.id}`} token={token} update={activeStatus} initialStatusId={activeStatusId} onClose={() => { setActiveStatus(null); setActiveStatusId(null); }} onOpenChat={(person) => { setActiveStatus(null); setActiveStatusId(null); chooseConversation(person); }} onDelete={removeStatus} />}
       {groupDetailsOpen && active?.kind === 'group' && <GroupDetailsModal token={token} group={active} onClose={() => setGroupDetailsOpen(false)} />}
-      {settingsOpen && <SettingsModal token={token} user={user} initialSection={settingsSection} onClose={() => setSettingsOpen(false)} onSave={updateProfile} onSignOut={signOut} />}
+      {settingsOpen && <SettingsModal token={token} user={user} initialSection={settingsSection} chatWallpaper={chatWallpaper} onWallpaperChange={setChatWallpaper} theme={theme} onThemeChange={setTheme} onClose={() => setSettingsOpen(false)} onSave={updateProfile} onSignOut={signOut} />}
       {contactProfileOpen && active && <ContactProfileModal token={token} person={active} online={onlineUsers.has(active.id)} savedName={contacts.find((contact) => contact.id === active.id)?.nickname || active.saved_as} onSaveContact={saveContact} onClose={() => setContactProfileOpen(false)} />}
     </main>
   );
