@@ -1,3 +1,4 @@
+import { registerUser, loginUser, logoutUser, onAuthChange, isCodeAvailable } from './lib/auth';
 import { useEffect, useRef, useState } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { io } from 'socket.io-client';
@@ -280,32 +281,28 @@ function AuthScreen({ onLogin }) {
   const [showServerSetup, setShowServerSetup] = useState(false);
   const [serverAddress, setServerAddress] = useState(apiBaseUrl);
   const [codeAvailability, setCodeAvailability] = useState('');
+  
+  useEffect(() => {
+  if (screen !== 'register' || registerStep !== 1 || !/^\d{8}$/.test(contactCode)) {
+    setCodeAvailability('');
+    return undefined;
+  }
+  let active = true;
+  setCodeAvailability('checking');
+  const timer = setTimeout(async () => {
+    const available = await isCodeAvailable(contactCode);
+    if (active) setCodeAvailability(available ? 'available' : 'taken');
+  }, 400);
+  return () => {
+    active = false;
+    clearTimeout(timer);
+  };
+}, [screen, registerStep, contactCode]);
 
   useEffect(() => {
     if (!photoPreview.startsWith('blob:')) return undefined;
     return () => URL.revokeObjectURL(photoPreview);
   }, [photoPreview]);
-
-  useEffect(() => {
-    if (screen !== 'register' || registerStep !== 1 || !/^\d{8}$/.test(contactCode)) return undefined;
-    let active = true;
-    setCodeAvailability('checking');
-    const timer = setTimeout(async () => {
-      try {
-        await api('/api/auth/check-code', null, {
-          method: 'POST',
-          body: JSON.stringify({ contactCode }),
-        });
-        if (active) setCodeAvailability('available');
-      } catch (requestError) {
-        if (active) setCodeAvailability(requestError.message.includes('already taken') ? 'taken' : 'unavailable');
-      }
-    }, 250);
-    return () => {
-      active = false;
-      clearTimeout(timer);
-    };
-  }, [screen, registerStep, contactCode]);
 
   function selectPhoto(event) {
     const file = event.target.files?.[0];
@@ -327,20 +324,17 @@ function AuthScreen({ onLogin }) {
       return;
     }
     if (registerStep === 1) {
-      setBusy(true);
-      try {
-        await api('/api/auth/check-code', null, {
-          method: 'POST',
-          body: JSON.stringify({ contactCode }),
-        });
-        setRegisterStep(2);
-      } catch (requestError) {
-        setError(requestError.message);
-      } finally {
-        setBusy(false);
-      }
-      return;
-    }
+  if (codeAvailability === 'taken') {
+    setError('This code is already taken. Choose another.');
+    return;
+  }
+  if (codeAvailability !== 'available') {
+    setError('Please wait for the code check to finish.');
+    return;
+  }
+  setRegisterStep(2);
+  return;
+}
     if (registerStep === 2) {
       if (password.length < 8 || password.length > 72) {
         setError('Password must be between 8 and 72 characters.');
@@ -380,18 +374,41 @@ function AuthScreen({ onLogin }) {
     setBusy(true);
     try {
       const isRegister = screen === 'register';
-      const result = await api(`/api/auth/${isRegister ? 'register' : 'login'}`, null, {
-        method: 'POST',
-        body: JSON.stringify(isRegister
-          ? { contactCode, password, displayName, bio, policiesAccepted }
-          : { code: contactCode, password }),
-      });
-      if (isRegister && photoFile) {
-        result.user = await uploadAvatar(result.token, photoFile);
+      let result;
+
+      if (isRegister) {
+        const newUser = await registerUser({
+          contactCode,
+          password,
+          displayName,
+          bio,
+        });
+        result = { user: newUser };
+      } else {
+        const loggedInUser = await loginUser({
+          contactCode,
+          password,
+        });
+        result = { user: loggedInUser };
       }
+
       onLogin(result);
     } catch (requestError) {
-      setError(requestError.message);
+      let message = requestError.message || 'Something went wrong.';
+      if (message.includes('email-already-in-use')) {
+        message = 'This code is already taken. Choose another.';
+      } else if (message.includes('invalid-credential') || message.includes('wrong-password')) {
+        message = 'Incorrect code or password.';
+      } else if (message.includes('user-not-found')) {
+        message = 'No account found with that code.';
+      } else if (message.includes('weak-password')) {
+        message = 'Password is too weak. Use at least 8 characters.';
+      } else if (message.includes('network-request-failed')) {
+        message = 'Network error. Check your internet connection.';
+      } else if (message.includes('invalid-email')) {
+        message = 'Enter a valid 8-digit code.';
+      }
+      setError(message);
     } finally {
       setBusy(false);
     }
@@ -399,7 +416,13 @@ function AuthScreen({ onLogin }) {
 
   return (
     <main className="auth-page">
-      <div className="auth-topline"><a className="brand" href="#"><img className="brand-mark-image" src="/farazchat-mark.svg" alt="" /><span>Faraz<span className="brand-light">Chat</span></span></a><span className="private-note"><LockKeyhole size={13} /> PRIVATE MESSAGING</span></div>
+      <div className="auth-topline">
+        <a className="brand" href="#">
+          <img className="brand-mark-image" src="/farazchat-mark.svg" alt="" />
+          <span>Faraz<span className="brand-light">Chat</span></span>
+        </a>
+        <span className="private-note"><LockKeyhole size={13} /> PRIVATE MESSAGING</span>
+      </div>
       <section className="auth-content">
         <div className="auth-copy">
           <div className="eyebrow"><span className="live-dot" /> YOUR PEOPLE, RIGHT HERE</div>
@@ -408,62 +431,160 @@ function AuthScreen({ onLogin }) {
           <div className="auth-footnote"><ShieldCheck size={17} /><span>Accounts and messages stay on your FarazChat server.</span></div>
         </div>
         <div className="auth-form-wrap">
-          {screen === 'welcome' && showServerSetup && <div className="auth-choice-screen"><span className="form-icon"><MessageCircle size={19} /></span><h2>Connect to your server</h2><p>Enter the HTTPS address where your FarazChat server is hosted.</p><form className="auth-form" onSubmit={saveServerAddress}><label htmlFor="server-address">Server address</label><div className="field-with-icon"><LockKeyhole size={17} /><input id="server-address" type="url" autoComplete="url" autoCapitalize="off" spellCheck="false" value={serverAddress} onChange={(event) => setServerAddress(event.target.value)} placeholder="https://chat.example.com" required /></div>{error && <p className="form-error" role="alert">{error}</p>}<button className="primary-button auth-submit" type="submit">Connect <span>→</span></button><button type="button" className="secondary-button" onClick={() => { setShowServerSetup(false); setError(''); }}>Back</button></form></div>}
-          {screen === 'welcome' && !showServerSetup && <div className="auth-choice-screen"><span className="form-icon"><MessageCircle size={19} /></span><h2>Welcome to FarazChat</h2><p>Choose how you want to continue.</p><button className="primary-button" onClick={() => setScreen('register')}>Create account <span>→</span></button><button className="secondary-button" onClick={() => setScreen('login')}>Log in <span>→</span></button>{isNativePlatform && <button className="ghost-button" type="button" style={{ marginTop: '8px', width: '100%' }} onClick={() => setShowServerSetup(true)}>Use custom server</button>}</div>}
+          {screen === 'welcome' && showServerSetup && (
+            <div className="auth-choice-screen">
+              <span className="form-icon"><MessageCircle size={19} /></span>
+              <h2>Connect to your server</h2>
+              <p>Enter the HTTPS address where your FarazChat server is hosted.</p>
+              <form className="auth-form" onSubmit={saveServerAddress}>
+                <label htmlFor="server-address">Server address</label>
+                <div className="field-with-icon">
+                  <LockKeyhole size={17} />
+                  <input id="server-address" type="url" autoComplete="url" autoCapitalize="off" spellCheck="false" value={serverAddress} onChange={(event) => setServerAddress(event.target.value)} placeholder="https://chat.example.com" required />
+                </div>
+                {error && <p className="form-error" role="alert">{error}</p>}
+                <button className="primary-button auth-submit" type="submit">Connect <span>→</span></button>
+                <button type="button" className="secondary-button" onClick={() => { setShowServerSetup(false); setError(''); }}>Back</button>
+              </form>
+            </div>
+          )}
+
+          {screen === 'welcome' && !showServerSetup && (
+            <div className="auth-choice-screen">
+              <span className="form-icon"><MessageCircle size={19} /></span>
+              <h2>Welcome to FarazChat</h2>
+              <p>Choose how you want to continue.</p>
+              <button className="primary-button" onClick={() => setScreen('register')}>Create account <span>→</span></button>
+              <button className="secondary-button" onClick={() => setScreen('login')}>Log in <span>→</span></button>
+              {isNativePlatform && <button className="ghost-button" type="button" style={{ marginTop: '8px', width: '100%' }} onClick={() => setShowServerSetup(true)}>Use custom server</button>}
+            </div>
+          )}
+
           {screen === 'login' && <>
-            <div className="auth-form-heading"><span className="form-icon"><LockKeyhole size={19} /></span><div><h2>Log in</h2><p>Enter your 8-digit contact code and password.</p></div></div>
+            <div className="auth-form-heading">
+              <span className="form-icon"><LockKeyhole size={19} /></span>
+              <div><h2>Log in</h2><p>Enter your 8-digit contact code and password.</p></div>
+            </div>
             <form className="auth-form" onSubmit={submit}>
               <label htmlFor="login-code">8-digit contact code</label>
-              <div className="field-with-icon"><UserRound size={17} /><input id="login-code" autoComplete="username" value={contactCode} onChange={(event) => setContactCode(event.target.value.trim().slice(0, 24))} placeholder="8-digit contact code" maxLength={24} required /></div>
-              <p className="auth-hint">Older accounts can still use their previous username.</p>
+              <div className="field-with-icon">
+                <UserRound size={17} />
+                <input id="login-code" autoComplete="username" value={contactCode} onChange={(event) => setContactCode(event.target.value.trim().slice(0, 24))} placeholder="8-digit contact code" maxLength={24} required />
+              </div>
               <label htmlFor="login-password">Password</label>
-              <div className="field-with-icon"><LockKeyhole size={17} /><input id="login-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" placeholder="Your password" required /></div>
+              <div className="field-with-icon">
+                <LockKeyhole size={17} />
+                <input id="login-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" placeholder="Your password" required />
+              </div>
               {error && <p className="form-error" role="alert">{error}</p>}
               <button className="primary-button auth-submit" disabled={busy}>{busy ? 'Signing in…' : 'Log in'}<span>→</span></button>
             </form>
             <button className="auth-back-button" onClick={() => { setScreen('welcome'); setError(''); }}>← Back</button>
           </>}
+
           {screen === 'register' && <>
-            <div className="register-progress"><span>STEP {registerStep} OF 4</span><div><i style={{ width: `${registerStep * 25}%` }} /></div><button onClick={() => { setScreen('welcome'); setRegisterStep(1); setError(''); }}>Cancel</button></div>
+            <div className="register-progress">
+              <span>STEP {registerStep} OF 4</span>
+              <div><i style={{ width: `${registerStep * 25}%` }} /></div>
+              <button onClick={() => { setScreen('welcome'); setRegisterStep(1); setError(''); }}>Cancel</button>
+            </div>
             <form className="auth-form register-step-form" onSubmit={registerStep === 4 ? submit : (event) => { event.preventDefault(); continueRegistration(); }}>
               {registerStep === 1 && <>
-                <div className="auth-form-heading"><span className="form-icon"><UserRound size={19} /></span><div><h2>Choose your code</h2><p>People will use this unique code to find you.</p></div></div>
+                <div className="auth-form-heading">
+                  <span className="form-icon"><UserRound size={19} /></span>
+                  <div><h2>Choose your code</h2><p>People will use this unique code to find you.</p></div>
+                </div>
                 <label htmlFor="register-code">8-digit contact code</label>
-                <div className="field-with-icon"><span className="code-prefix">#</span><input id="register-code" inputMode="numeric" autoComplete="off" value={contactCode} onChange={(event) => { const nextCode = event.target.value.replace(/\D/g, '').slice(0, 8); setContactCode(nextCode); setError(''); setCodeAvailability(/^\d{8}$/.test(nextCode) ? 'checking' : ''); }} placeholder="8 numbers" pattern="[0-9]{8}" minLength={8} maxLength={8} disabled={busy} required /></div>
-                <p className={`code-availability${codeAvailability ? ` code-availability-${codeAvailability}` : ''}`} role={codeAvailability === 'taken' ? 'alert' : 'status'} aria-live="polite">{codeAvailability === 'checking' ? 'Checking code…' : codeAvailability === 'available' ? 'This code is available.' : codeAvailability === 'taken' ? 'This code is already in use. Choose another.' : codeAvailability === 'unavailable' ? 'Could not check this code. Tap Continue to retry.' : 'Use this code to log in and let friends find you.'}</p>
+                <div className="field-with-icon">
+                  <span className="code-prefix">#</span>
+                  <input id="register-code" inputMode="numeric" autoComplete="off" value={contactCode} onChange={(event) => { const nextCode = event.target.value.replace(/\D/g, '').slice(0, 8); setContactCode(nextCode); setError(''); setCodeAvailability(''); }} placeholder="8 numbers" pattern="[0-9]{8}" minLength={8} maxLength={8} disabled={busy} required />
+                </div>
+                <p className={`code-availability${codeAvailability ? ` code-availability-${codeAvailability}` : ''}`} role={codeAvailability === 'taken' ? 'alert' : 'status'} aria-live="polite">
+                  {codeAvailability === 'checking' ? 'Checking code…' : codeAvailability === 'available' ? 'This code is available.' : codeAvailability === 'taken' ? 'This code is already in use. Choose another.' : 'Use this code to log in and let friends find you.'}
+                </p>
               </>}
               {registerStep === 2 && <>
-                <div className="auth-form-heading"><span className="form-icon"><LockKeyhole size={19} /></span><div><h2>Secure your account</h2><p>Choose a password and confirm it.</p></div></div>
+                <div className="auth-form-heading">
+                  <span className="form-icon"><LockKeyhole size={19} /></span>
+                  <div><h2>Secure your account</h2><p>Choose a password and confirm it.</p></div>
+                </div>
                 <label htmlFor="register-password">Password</label>
-                <div className="field-with-icon"><LockKeyhole size={17} /><input id="register-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" placeholder="At least 8 characters" minLength={8} maxLength={72} required /></div>
+                <div className="field-with-icon">
+                  <LockKeyhole size={17} />
+                  <input id="register-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" placeholder="At least 8 characters" minLength={8} maxLength={72} required />
+                </div>
                 <label htmlFor="register-password-confirm">Confirm password</label>
-                <div className="field-with-icon"><LockKeyhole size={17} /><input id="register-password-confirm" type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" placeholder="Enter it again" minLength={8} maxLength={72} required /></div>
+                <div className="field-with-icon">
+                  <LockKeyhole size={17} />
+                  <input id="register-password-confirm" type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" placeholder="Enter it again" minLength={8} maxLength={72} required />
+                </div>
               </>}
               {registerStep === 3 && <>
-                <div className="auth-form-heading"><span className="form-icon"><Camera size={19} /></span><div><h2>Make it yours</h2><p>Add your name and a profile photo.</p></div></div>
-                <div className="signup-photo-row"><Avatar name={displayName || contactCode} src={photoPreview} large /><label className="photo-pick-button"><Camera size={15} /> Add profile photo<input type="file" accept="image/jpeg,image/png,image/webp" onChange={selectPhoto} /></label><span>Optional · up to 2 MB</span></div>
+                <div className="auth-form-heading">
+                  <span className="form-icon"><Camera size={19} /></span>
+                  <div><h2>Make it yours</h2><p>Add your name and a profile photo.</p></div>
+                </div>
+                <div className="signup-photo-row">
+                  <Avatar name={displayName || contactCode} src={photoPreview} large />
+                  <label className="photo-pick-button"><Camera size={15} /> Add profile photo<input type="file" accept="image/jpeg,image/png,image/webp" onChange={selectPhoto} /></label>
+                  <span>Optional · up to 2 MB</span>
+                </div>
                 <label htmlFor="display-name">Your name</label>
-                <div className="field-with-icon"><UserRound size={17} /><input id="display-name" value={displayName} onChange={(event) => setDisplayName(event.target.value)} autoComplete="name" placeholder="Your name" maxLength={40} required /></div>
+                <div className="field-with-icon">
+                  <UserRound size={17} />
+                  <input id="display-name" value={displayName} onChange={(event) => setDisplayName(event.target.value)} autoComplete="name" placeholder="Your name" maxLength={40} required />
+                </div>
               </>}
               {registerStep === 4 && <>
-                <div className="auth-form-heading"><span className="form-icon"><ShieldCheck size={19} /></span><div><h2>One last thing</h2><p>Add a short bio and review the policies.</p></div></div>
+                <div className="auth-form-heading">
+                  <span className="form-icon"><ShieldCheck size={19} /></span>
+                  <div><h2>One last thing</h2><p>Add a short bio and review the policies.</p></div>
+                </div>
                 <label htmlFor="register-bio">Bio <span className="optional-label">OPTIONAL</span></label>
                 <textarea className="profile-textarea signup-bio" id="register-bio" value={bio} onChange={(event) => setBio(event.target.value)} placeholder="A little about you" maxLength={160} />
-                <div className="account-policies"><strong>Before you join</strong><ul><li>Your password cannot be recovered. Keep it somewhere safe.</li><li>Your 8-digit code is how other members find you.</li><li>Messages and files are stored on this app’s server, not end-to-end encrypted.</li><li>Status updates disappear after 24 hours. Use privacy settings to control search visibility.</li></ul></div>
-                <label className="policy-consent"><input type="checkbox" checked={policiesAccepted} onChange={(event) => setPoliciesAccepted(event.target.checked)} /><span>I understand and agree to these account policies.</span></label>
+                <div className="account-policies">
+                  <strong>Before you join</strong>
+                  <ul>
+                    <li>Your password cannot be recovered. Keep it somewhere safe.</li>
+                    <li>Your 8-digit code is how other members find you.</li>
+                    <li>Messages and files are stored on this app's server, not end-to-end encrypted.</li>
+                    <li>Status updates disappear after 24 hours. Use privacy settings to control search visibility.</li>
+                  </ul>
+                </div>
+                <label className="policy-consent">
+                  <input type="checkbox" checked={policiesAccepted} onChange={(event) => setPoliciesAccepted(event.target.checked)} />
+                  <span>I understand and agree to these account policies.</span>
+                </label>
               </>}
               {error && <p className="form-error" role="alert">{error}</p>}
-              <div className="register-step-actions">{registerStep > 1 && <button type="button" className="secondary-button" onClick={() => { setError(''); setRegisterStep((step) => step - 1); }}>Back</button>}<button type="submit" className="primary-button auth-submit" disabled={busy || (registerStep === 4 && !policiesAccepted) || (registerStep === 1 && ['checking', 'taken'].includes(codeAvailability))}>{busy ? registerStep === 1 ? 'Checking…' : 'Creating…' : registerStep === 4 ? 'Create account' : 'Continue'}<span>→</span></button></div>
+              <div className="register-step-actions">
+                {registerStep > 1 && <button type="button" className="secondary-button" onClick={() => { setError(''); setRegisterStep((step) => step - 1); }}>Back</button>}
+                <button type="submit" className="primary-button auth-submit" disabled={busy || (registerStep === 4 && !policiesAccepted) || (registerStep === 1 && codeAvailability !== 'available')} >
+                  {busy ? (registerStep === 1 ? 'Checking…' : 'Creating…') : (registerStep === 4 ? 'Create account' : 'Continue')}
+                  <span>→</span>
+                </button>
+              </div>
             </form>
           </>}
-          {screen !== 'welcome' && <p className="auth-mode-switch">{screen === 'login' ? 'New to FarazChat?' : 'Already registered?'} <button onClick={() => { setScreen(screen === 'login' ? 'register' : 'login'); setRegisterStep(1); setError(''); }}> {screen === 'login' ? 'Create account' : 'Log in'}</button></p>}
+
+          {screen !== 'welcome' && (
+            <p className="auth-mode-switch">
+              {screen === 'login' ? 'New to FarazChat?' : 'Already registered?'}{' '}
+              <button onClick={() => { setScreen(screen === 'login' ? 'register' : 'login'); setRegisterStep(1); setError(''); }}>
+                {screen === 'login' ? 'Create account' : 'Log in'}
+              </button>
+            </p>
+          )}
         </div>
       </section>
-      <footer className="auth-footer"><span>FARAZCHAT</span><span>Made for the conversations that matter.</span><span>YOUR SPACE, YOUR PEOPLE</span></footer>
+      <footer className="auth-footer">
+        <span>FARAZCHAT</span>
+        <span>Made for the conversations that matter.</span>
+        <span>YOUR SPACE, YOUR PEOPLE</span>
+      </footer>
     </main>
   );
 }
-
 function NewChatModal({ token, onClose, onSelect }) {
   const [query, setQuery] = useState('');
   const [users, setUsers] = useState([]);
@@ -1316,11 +1437,9 @@ function App() {
   }, [messages]);
 
   function handleLogin(result) {
-    localStorage.setItem(TOKEN_KEY, result.token);
-    setToken(result.token);
-    setUser(result.user);
-    setError('');
-  }
+  setUser(result.user);
+  setError('');
+}
 
   function signOut() {
     localStorage.removeItem(TOKEN_KEY);
