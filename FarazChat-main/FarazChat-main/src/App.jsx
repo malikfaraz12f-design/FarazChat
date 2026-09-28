@@ -1,3 +1,4 @@
+import { searchUserByCode } from './lib/users';
 import { registerUser, loginUser, logoutUser, onAuthChange, isCodeAvailable } from './lib/auth';
 import { useEffect, useRef, useState } from 'react';
 import { Capacitor } from '@capacitor/core';
