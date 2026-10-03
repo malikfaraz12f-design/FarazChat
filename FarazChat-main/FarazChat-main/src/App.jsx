@@ -2,7 +2,15 @@ import { searchUserByCode, getMyProfile, updateUserProfile } from './lib/users';
 import { registerUser, loginUser, logoutUser, changeUserPassword, onAuthChange, isCodeAvailable } from './lib/auth';
 import { subscribeToConversations } from './lib/conversations';
 import { markMessagesAsRead, sendTextMessage, subscribeToMessages } from './lib/messages';
-import { createGroup, getGroupMembers, subscribeToGroups } from './lib/groups';
+import {
+  addGroupMember as addFirestoreGroupMember,
+  createGroup,
+  getGroupMembers,
+  leaveGroup as leaveFirestoreGroup,
+  removeGroupMember as removeFirestoreGroupMember,
+  subscribeToGroups,
+  updateGroupDetails as updateFirestoreGroupDetails,
+} from './lib/groups';
 import { saveContact as saveFirestoreContact, subscribeToContacts } from './lib/contacts';
 import {
   addStatusComment,
@@ -594,7 +602,7 @@ function GroupModal({ user, onClose, onCreate }) {
     });
   }
 
-  async function createGroup(event) {
+  async function handleCreateGroup(event) {
     event.preventDefault();
     setError('');
     setBusy(true);
@@ -616,7 +624,7 @@ function GroupModal({ user, onClose, onCreate }) {
     <div className="modal-scrim" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="new-chat-modal group-create-modal" role="dialog" aria-modal="true" aria-labelledby="group-title">
         <div className="modal-heading"><div><span className="modal-kicker">BRING EVERYONE TOGETHER</span><h2 id="group-title">New group</h2></div><button className="icon-button" onClick={onClose} aria-label="Close"><X size={19} /></button></div>
-        <form className="group-create-form" onSubmit={createGroup}>
+        <form className="group-create-form" onSubmit={handleCreateGroup}>
           <label htmlFor="group-name">Group name</label>
           <input className="profile-input" id="group-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Weekend plans" maxLength={40} required />
           <label className="search-field modal-search group-search"><Search size={17} /><input inputMode="numeric" value={query} onChange={(event) => setQuery(event.target.value.replace(/\D/g, '').slice(0, 8))} placeholder="Find by 8-digit code" maxLength={8} /></label>
@@ -804,23 +812,136 @@ function StatusActivityModal({ notifications, onClose, onOpenStatus }) {
   );
 }
 
-function GroupDetailsModal({ group, onClose }) {
+function GroupDetailsModal({ group, currentUser, onClose, onUpdate, onAddMember, onRemoveMember, onLeave }) {
   const [members, setMembers] = useState([]);
+  const [name, setName] = useState(group.name || '');
+  const [bio, setBio] = useState(group.bio || '');
+  const [photoPreview, setPhotoPreview] = useState(group.avatar_url || '');
+  const [avatarBase64, setAvatarBase64] = useState(group.avatarBase64 || '');
+  const [searchCode, setSearchCode] = useState('');
+  const [searchResult, setSearchResult] = useState(null);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const canManage = group.createdBy === currentUser.id;
+
   useEffect(() => {
     let alive = true;
     getGroupMembers(group).then((result) => {
       if (alive) setMembers(result);
     }).catch((requestError) => { if (alive) setError(requestError.message); });
     return () => { alive = false; };
-  }, [group]);
+  }, [group.id, group.memberIds]);
+
+  useEffect(() => {
+    let alive = true;
+    if (!/^\d{8}$/.test(searchCode.trim())) {
+      setSearchResult(null);
+      return () => { alive = false; };
+    }
+    const timer = setTimeout(async () => {
+      try {
+        const person = await searchUserByCode(searchCode.trim());
+        if (alive) setSearchResult(person);
+      } catch (requestError) {
+        if (alive) setError(requestError.message);
+      }
+    }, 180);
+    return () => { alive = false; clearTimeout(timer); };
+  }, [searchCode]);
+
+  async function saveGroupProfile(event) {
+    event.preventDefault();
+    setError('');
+    setNotice('');
+    setBusy(true);
+    try {
+      await onUpdate(group.id, { name, bio, avatarBase64 });
+      setNotice('Group profile updated.');
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function chooseGroupPhoto(event) {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 2 * 1024 * 1024) {
+      setError('Choose a JPEG, PNG, or WebP image under 2 MB.');
+      return;
+    }
+    setError('');
+    try {
+      const photo = await compressImage(file);
+      if (photo.length > 800_000) throw new Error('Choose a smaller group photo.');
+      setAvatarBase64(photo);
+      setPhotoPreview(`data:image/jpeg;base64,${photo}`);
+    } catch (photoError) {
+      setError(photoError.message || 'Could not process that group photo.');
+    }
+  }
+
+  async function addMember() {
+    if (!searchResult) return;
+    setError('');
+    setBusy(true);
+    try {
+      await onAddMember(group.id, searchResult.id);
+      setSearchCode('');
+      setSearchResult(null);
+      setNotice(`${searchResult.display_name || searchResult.username} added to the group.`);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeMember(member) {
+    if (!window.confirm(`Remove ${member.display_name || member.username} from this group?`)) return;
+    setError('');
+    setBusy(true);
+    try {
+      await onRemoveMember(group.id, member.id);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function leaveThisGroup() {
+    if (!window.confirm(`Leave ${group.name}?`)) return;
+    setError('');
+    setBusy(true);
+    try {
+      await onLeave(group.id);
+    } catch (requestError) {
+      setError(requestError.message);
+      setBusy(false);
+    }
+  }
 
   return (
     <div className="modal-scrim" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="contact-profile-modal group-details-modal" role="dialog" aria-modal="true" aria-label={`${group.name} group details`}>
         <button className="icon-button contact-profile-close" onClick={onClose} aria-label="Close group details"><X size={19} /></button>
-        <span className="group-details-icon"><UsersRound size={28} /></span><h2>{group.name}</h2><span className="contact-profile-username">{members.length || group.member_count} members</span>
-        <div className="group-member-list">{members.map((member) => <div key={member.id}><Avatar name={member.display_name || member.username} src={member.avatar_url} /><span><strong>{member.display_name || member.username}</strong><small>#{member.contact_code || member.username}{member.role === 'admin' ? ' · admin' : ''}</small></span></div>)}</div>
+        <div className="group-details-profile"><Avatar name={group.name} src={photoPreview} large /><h2>{group.name}</h2><span className="contact-profile-username">{members.length || group.member_count} members</span><p>{group.bio || 'No group bio yet.'}</p></div>
+        {canManage && <form className="group-profile-form" onSubmit={saveGroupProfile}>
+          <label className="group-photo-picker"><Camera size={15} /> Change group photo<input type="file" accept="image/jpeg,image/png,image/webp" onChange={chooseGroupPhoto} disabled={busy} /></label>
+          <label htmlFor="group-profile-name">Group name</label><input className="profile-input" id="group-profile-name" value={name} onChange={(event) => setName(event.target.value)} maxLength={40} required />
+          <label htmlFor="group-profile-bio">Group bio</label><textarea className="profile-textarea" id="group-profile-bio" value={bio} onChange={(event) => setBio(event.target.value)} maxLength={240} placeholder="What is this group about?" />
+          <button className="primary-button" disabled={busy}>{busy ? 'Saving…' : 'Save group profile'}</button>
+        </form>}
+        {canManage && <div className="group-add-member"><label htmlFor="group-member-code">Add a member by 8-digit code</label><div className="search-field group-search"><Search size={16} /><input id="group-member-code" inputMode="numeric" value={searchCode} onChange={(event) => setSearchCode(event.target.value.replace(/\D/g, '').slice(0, 8))} placeholder="Contact code" maxLength={8} /></div>
+          {searchResult && <div className="group-user-result"><Avatar name={searchResult.display_name || searchResult.username} src={searchResult.avatar_url} /><span><strong>{searchResult.display_name || searchResult.username}</strong><small>#{searchResult.contact_code || searchResult.username}</small></span><button type="button" className="secondary-button" onClick={addMember} disabled={busy || group.memberIds?.includes(searchResult.id) || group.memberIds?.length >= 50}>{group.memberIds?.includes(searchResult.id) ? 'Added' : group.memberIds?.length >= 50 ? 'Group full' : 'Add'}</button></div>}
+        </div>}
+        <div className="group-member-list"><h3>Members</h3>{members.map((member) => <div key={member.id}><Avatar name={member.display_name || member.username} src={member.avatar_url} /><span><strong>{member.display_name || member.username}{member.id === currentUser.id ? ' · You' : ''}</strong><small>#{member.contact_code || member.username}{member.id === group.createdBy ? ' · creator' : ''}</small></span>{canManage && member.id !== currentUser.id && <button type="button" className="group-member-remove" onClick={() => removeMember(member)} disabled={busy} aria-label={`Remove ${member.display_name || member.username}`} title="Remove member"><X size={15} /></button>}</div>)}</div>
+        <button type="button" className="group-leave-button" onClick={leaveThisGroup} disabled={busy}><LogOut size={15} /> Leave group</button>
+        {notice && <p className="settings-success" role="status">{notice}</p>}
         {error && <p className="form-error">{error}</p>}
       </section>
     </div>
@@ -1043,6 +1164,7 @@ function App() {
   const [statusUpdates, setStatusUpdates] = useState([]);
   const [active, setActive] = useState(null);
   const [messages, setMessages] = useState([]);
+  const [groupMembersById, setGroupMembersById] = useState(() => new Map());
   const [draft, setDraft] = useState('');
   const [filter, setFilter] = useState('');
   const [modalOpen, setModalOpen] = useState(false);
@@ -1183,6 +1305,23 @@ function App() {
   }, [active?.id, active?.kind, messages, user?.id]);
 
   useEffect(() => {
+    if (!active || active.kind !== 'group') {
+      setGroupMembersById(new Map());
+      return undefined;
+    }
+    let alive = true;
+    setGroupMembersById(new Map());
+    getGroupMembers(active)
+      .then((members) => {
+        if (alive) setGroupMembersById(new Map(members.map((member) => [member.id, member])));
+      })
+      .catch((loadError) => {
+        if (alive) setError(loadError.message);
+      });
+    return () => { alive = false; };
+  }, [active?.id, active?.kind]);
+
+  useEffect(() => {
     messageEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }, [messages]);
 
@@ -1261,6 +1400,33 @@ function App() {
   function handleGroupCreated(group) {
     setGroupModalOpen(false);
     chooseGroup(group);
+  }
+
+  function syncGroupState(updatedGroup) {
+    setGroups((current) => current.map((group) => group.id === updatedGroup.id ? updatedGroup : group));
+    setActive((current) => current?.id === updatedGroup.id ? { ...updatedGroup, kind: 'group' } : current);
+  }
+
+  async function updateGroupProfile(groupId, updates) {
+    const updatedGroup = await updateFirestoreGroupDetails(groupId, updates);
+    syncGroupState(updatedGroup);
+  }
+
+  async function addGroupMember(groupId, memberId) {
+    const updatedGroup = await addFirestoreGroupMember(groupId, memberId);
+    syncGroupState(updatedGroup);
+  }
+
+  async function removeGroupMember(groupId, memberId) {
+    const updatedGroup = await removeFirestoreGroupMember(groupId, memberId);
+    syncGroupState(updatedGroup);
+  }
+
+  async function leaveCurrentGroup(groupId) {
+    await leaveFirestoreGroup(groupId, user.id);
+    setGroupDetailsOpen(false);
+    setGroups((current) => current.filter((group) => group.id !== groupId));
+    setActive((current) => current?.id === groupId ? null : current);
   }
 
   async function publishStatus() {
@@ -1502,7 +1668,7 @@ function App() {
             <span className="conversation-avatar-wrap"><Avatar name={conversation.display_name || conversation.username} src={conversation.avatar_url} />{onlineUsers.has(conversation.id) && <i className="presence-dot" />}</span>
             <span className="conversation-copy"><span className="conversation-top"><strong>{conversation.display_name || conversation.username}</strong><time>{relativeTime(conversation.last_message_at)}</time></span><span className="conversation-bottom"><span>{conversation.last_message || `#${conversation.contact_code || conversation.username}`}</span>{onlineUsers.has(conversation.id) && <i className="conversation-online-label">Online</i>}</span></span>
           </button>)}
-          {inboxView === 'groups' && filteredGroups.map((group) => <button key={group.id} className={`conversation-item group-conversation${active?.kind === 'group' && active.id === group.id ? ' conversation-active' : ''}`} onClick={() => chooseGroup(group)}><span className="group-avatar"><UsersRound size={18} /></span><span className="conversation-copy"><span className="conversation-top"><strong>{group.name}</strong><time>{relativeTime(group.last_message_at)}</time></span><span className="conversation-bottom"><span>{group.last_message || `${group.member_count} members`}</span></span></span></button>)}
+          {inboxView === 'groups' && filteredGroups.map((group) => <button key={group.id} className={`conversation-item group-conversation${active?.kind === 'group' && active.id === group.id ? ' conversation-active' : ''}`} onClick={() => chooseGroup(group)}><span className="group-avatar">{group.avatar_url ? <Avatar name={group.name} src={group.avatar_url} /> : <UsersRound size={18} />}</span><span className="conversation-copy"><span className="conversation-top"><strong>{group.name}</strong><time>{relativeTime(group.last_message_at)}</time></span><span className="conversation-bottom"><span>{group.last_message || group.bio || `${group.member_count} members`}</span></span></span></button>)}
           {inboxView === 'status' && <div className="status-list"><button className="status-list-item my-status-item" onClick={() => { const ownStatus = statusUpdates.find((update) => update.own); if (ownStatus) { setActiveStatus(ownStatus); setActiveStatusId(null); } else setStatusComposerOpen(true); }}><span className="status-ring status-add-ring"><Avatar name={user.display_name || user.username} src={user.avatar_url} /><i>+</i></span><span><strong>My status</strong><small>{statusUpdates.find((update) => update.own)?.statuses.length ? `${statusUpdates.find((update) => update.own).statuses.length} updates · tap to view` : 'Share a photo or update'}</small></span><span className="status-add-control" aria-hidden="true"><Plus size={17} /></span></button>{statusUpdates.filter((update) => !update.own).map((update) => <button className="status-list-item" key={update.user.id} onClick={() => { setActiveStatus(update); setActiveStatusId(null); }}><span className={`status-ring${update.statuses.some((status) => !status.viewed) ? ' status-unviewed' : ''}`}><Avatar name={update.user.display_name || update.user.username} src={update.user.avatar_url} /></span><span><strong>{update.user.display_name || update.user.username}</strong><small>{update.statuses.length} update{update.statuses.length === 1 ? '' : 's'} · {relativeTime(new Date(update.statuses[0].created_at).toISOString().slice(0, 19).replace('T', ' '))}</small></span></button>)}</div>}
           {inboxView === 'chats' && filteredConversations.length === 0 && <div className="inbox-empty"><span className="empty-art"><MessageCircle size={24} /></span><strong>{filter ? 'No matches' : 'A little quiet here'}</strong><span>{filter ? 'Try a different name.' : 'Start a conversation with someone.'}</span>{!filter && <button onClick={() => setModalOpen(true)}>Find someone <span>↗</span></button>}</div>}
           {inboxView === 'groups' && filteredGroups.length === 0 && <div className="inbox-empty"><span className="empty-art"><UsersRound size={24} /></span><strong>{filter ? 'No matches' : 'No groups yet'}</strong><span>{filter ? 'Try another group name.' : 'Bring people together in a group.'}</span>{!filter && <button onClick={() => setGroupModalOpen(true)}>Create group <span>↗</span></button>}</div>}
@@ -1512,7 +1678,7 @@ function App() {
 
       <section className={`chat-panel${mobileChat ? ' chat-mobile-visible' : ''}`}>
         {active ? <>
-          <header className="chat-header"><button className="icon-button back-button" onClick={() => setMobileChat(false)} aria-label="Back to messages"><ArrowLeft size={19} /></button><button className="contact-profile-trigger" onClick={() => active.kind === 'group' ? setGroupDetailsOpen(true) : setContactProfileOpen(true)}><span className={active.kind === 'group' ? 'group-avatar chat-group-avatar' : ''}>{active.kind === 'group' ? <UsersRound size={19} /> : <Avatar name={active.display_name || active.username} src={active.avatar_url} />}</span><span className="chat-contact"><strong>{active.display_name || active.name || active.username}</strong><span className={`contact-status${active.kind !== 'group' && onlineUsers.has(active.id) ? ' is-online' : ''}`}><i />{contactTyping ? <>{typingName && `${typingName} `}typing<span className="typing-dots" aria-hidden="true"><i /><i /><i /></span></> : active.kind === 'group' ? `${active.member_count || active.members?.length || 0} members` : <>{onlineUsers.has(active.id) ? 'Online' : 'Offline'} · #{active.contact_code || active.username}</>}</span></span></button><button className="icon-button activity-button chat-activity-button" onClick={openStatusActivity} aria-label="Status activity" title="Status activity"><Bell size={18} />{statusNotifications.some((notification) => !notification.read_at) && <i>{statusNotifications.filter((notification) => !notification.read_at).length}</i>}</button><button className="chat-own-account" onClick={() => openSettings('profile')} aria-label={`Signed in as ${user.display_name || user.username}, code ${user.contact_code || user.username}`} title={`Signed in as ${user.display_name || user.username} · #${user.contact_code || user.username}`}><Avatar name={user.display_name || user.username} src={user.avatar_url} /><span><strong>{user.display_name || user.username}</strong><small>#{user.contact_code || user.username}</small></span></button></header>
+          <header className="chat-header"><button className="icon-button back-button" onClick={() => setMobileChat(false)} aria-label="Back to messages"><ArrowLeft size={19} /></button><button className="contact-profile-trigger" onClick={() => active.kind === 'group' ? setGroupDetailsOpen(true) : setContactProfileOpen(true)}><span className={active.kind === 'group' ? 'group-avatar chat-group-avatar' : ''}>{active.kind === 'group' ? (active.avatar_url ? <Avatar name={active.name} src={active.avatar_url} /> : <UsersRound size={19} />) : <Avatar name={active.display_name || active.username} src={active.avatar_url} />}</span><span className="chat-contact"><strong>{active.display_name || active.name || active.username}</strong><span className={`contact-status${active.kind !== 'group' && onlineUsers.has(active.id) ? ' is-online' : ''}`}><i />{contactTyping ? <>{typingName && `${typingName} `}<span className="typing-dots" aria-hidden="true"><i /><i /><i /></span></> : active.kind === 'group' ? `${active.member_count || active.members?.length || 0} members` : <>{onlineUsers.has(active.id) ? 'Online' : 'Offline'} · #{active.contact_code || active.username}</>}</span></span></button><button className="icon-button activity-button chat-activity-button" onClick={openStatusActivity} aria-label="Status activity" title="Status activity"><Bell size={18} />{statusNotifications.some((notification) => !notification.read_at) && <i>{statusNotifications.filter((notification) => !notification.read_at).length}</i>}</button><button className="chat-own-account" onClick={() => openSettings('profile')} aria-label={`Signed in as ${user.display_name || user.username}, code ${user.contact_code || user.username}`} title={`Signed in as ${user.display_name || user.username} · #${user.contact_code || user.username}`}><Avatar name={user.display_name || user.username} src={user.avatar_url} /><span><strong>{user.display_name || user.username}</strong><small>#{user.contact_code || user.username}</small></span></button></header>
           <div ref={messageStageRef} className={`message-stage wallpaper-${customChatWallpaper ? 'custom' : wallpaperPreset}`} style={customChatWallpaper ? { '--chat-wallpaper-image': `url("${chatWallpaper}")` } : undefined}>
             <div className="message-date"><span>YOUR CONVERSATION</span></div>
             {messages.length === 0 && <div className="first-message"><Avatar name={active.kind === 'group' ? active.name : active.display_name || active.username} src={active.avatar_url} large /><strong>{active.kind === 'group' ? active.name : `You and ${active.display_name || active.username}`}</strong><span>{active.kind === 'group' ? 'Your group conversation starts here.' : 'This is the beginning of your conversation.'}</span><span className="first-message-rule" /></div>}
@@ -1522,8 +1688,12 @@ function App() {
               const messageDelivered = message.is_delivered || messageSeen || (active.kind === 'group' && message.delivered_count > 0);
               const previous = messages[index - 1];
               const showAuthor = !previous || previous.sender_id !== message.sender_id;
+              const senderProfile = active.kind === 'group' ? groupMembersById.get(message.sender_id) : null;
+              const senderName = senderProfile?.display_name || senderProfile?.username || message.sender_display_name || message.sender_username;
               return <div className={`message-row${mine ? ' message-mine' : ''}${showAuthor ? ' message-first' : ''}`} data-message-id={message.id} key={message.id}>
-                <div className="message-stack">{active.kind === 'group' && showAuthor && !mine && <span className="group-message-author">{message.sender_display_name || message.sender_username}</span>}{message.body && <div className="message-bubble">{message.body}</div>}<span className="message-time">{relativeTime(message.created_at)}{mine && <span className={`message-read-receipt${messageSeen ? ' is-read' : messageDelivered ? ' is-delivered' : ''}`} title={active.kind === 'group' ? `${message.delivered_count || 0} delivered · ${message.read_count || 0} seen` : messageSeen ? 'Seen' : messageDelivered ? 'Delivered' : 'Sent'}>{active.kind === 'group' && message.read_count > 0 && <small>{message.read_count}/{message.recipient_count}</small>}{messageSeen || messageDelivered ? <CheckCheck size={14} /> : <Check size={13} />}</span>}</span></div>
+                {active.kind === 'group' && !mine && <span className="message-group-avatar"><Avatar name={senderName} src={senderProfile?.avatar_url || ''} /></span>}
+                <div className="message-stack">{active.kind === 'group' && showAuthor && !mine && <span className="group-message-author">{senderName}</span>}{message.body && <div className="message-bubble">{message.body}</div>}<span className="message-time">{relativeTime(message.created_at)}{mine && <span className={`message-read-receipt${messageSeen ? ' is-read' : messageDelivered ? ' is-delivered' : ''}`} title={active.kind === 'group' ? `${message.delivered_count || 0} delivered · ${message.read_count || 0} seen` : messageSeen ? 'Seen' : messageDelivered ? 'Delivered' : 'Sent'}>{active.kind === 'group' && message.read_count > 0 && <small>{message.read_count}/{message.recipient_count}</small>}{messageSeen || messageDelivered ? <CheckCheck size={14} /> : <Check size={13} />}</span>}</span></div>
+                {active.kind === 'group' && mine && <span className="message-group-avatar"><Avatar name={senderName} src={senderProfile?.avatar_url || ''} /></span>}
               </div>;
             })}
             <div ref={messageEndRef} />
@@ -1542,7 +1712,7 @@ function App() {
       {statusComposerOpen && <StatusComposerModal user={user} onClose={() => setStatusComposerOpen(false)} onPublished={publishStatus} />}
       {activityOpen && <StatusActivityModal notifications={statusNotifications} onClose={() => setActivityOpen(false)} onOpenStatus={openNotifiedStatus} />}
       {activeStatus && <StatusViewerModal key={`${activeStatus.user.id}-${activeStatusId || activeStatus.statuses[0]?.id}`} user={user} update={activeStatus} initialStatusId={activeStatusId} onClose={() => { setActiveStatus(null); setActiveStatusId(null); }} onOpenChat={(person) => { setActiveStatus(null); setActiveStatusId(null); chooseConversation(person); }} onDelete={removeStatus} />}
-      {groupDetailsOpen && active?.kind === 'group' && <GroupDetailsModal group={active} onClose={() => setGroupDetailsOpen(false)} />}
+      {groupDetailsOpen && active?.kind === 'group' && <GroupDetailsModal group={active} currentUser={user} onClose={() => setGroupDetailsOpen(false)} onUpdate={updateGroupProfile} onAddMember={addGroupMember} onRemoveMember={removeGroupMember} onLeave={leaveCurrentGroup} />}
       {settingsOpen && <SettingsModal user={user} initialSection={settingsSection} chatWallpaper={chatWallpaper} onWallpaperChange={setChatWallpaper} theme={theme} onThemeChange={setTheme} onClose={() => setSettingsOpen(false)} onSave={updateProfile} onSignOut={signOut} />}
       {contactProfileOpen && active && <ContactProfileModal person={active} online={onlineUsers.has(active.id)} savedName={contacts.find((contact) => contact.id === active.id)?.nickname || active.saved_as} onSaveContact={saveContact} onClose={() => setContactProfileOpen(false)} />}
     </main>
