@@ -12,6 +12,8 @@ export function normalizeUser(data, uid) {
     contact_code: data.contactCode || '',
     avatar_url: data.avatarBase64 ? `data:image/jpeg;base64,${data.avatarBase64}` : '',
     notifications_enabled: Boolean(data.notificationsEnabled),
+    allow_messages: data.allowMessages !== false,
+    blocked_user_ids: Array.isArray(data.blockedUserIds) ? data.blockedUserIds : [],
     last_seen: data.lastSeen || null,
   };
 }
@@ -39,7 +41,7 @@ export async function updateUserProfile(profileOrUid, updates = {}) {
     const values = typeof profileOrUid === 'string' ? updates : profileOrUid;
     const allowedFields = [
       'displayName', 'bio', 'avatarBase64', 'notificationsEnabled',
-      'discoverable', 'lastSeen',
+      'discoverable', 'allowMessages', 'blockedUserIds', 'lastSeen',
     ];
     const profileUpdates = Object.fromEntries(
       allowedFields

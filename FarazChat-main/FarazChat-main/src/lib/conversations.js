@@ -48,13 +48,12 @@ async function mapConversations(snapshot, userId) {
 export function subscribeToConversations(userId, onConversations, onError) {
   try {
     const messagesQueries = [
-      query(collection(db, 'messages'), where('participants', 'array-contains', userId)),
-      query(collection(db, 'messages'), where('senderId', '==', userId)),
-      query(collection(db, 'messages'), where('recipientId', '==', userId)),
+      { name: 'senderId', reference: query(collection(db, 'messages'), where('senderId', '==', userId)) },
+      { name: 'recipientId', reference: query(collection(db, 'messages'), where('recipientId', '==', userId)) },
     ];
     const snapshots = messagesQueries.map(() => new Map());
     let requestId = 0;
-    const unsubscribes = messagesQueries.map((messagesQuery, index) => onSnapshot(messagesQuery, (snapshot) => {
+    const unsubscribes = messagesQueries.map(({ name, reference }, index) => onSnapshot(reference, (snapshot) => {
       snapshots[index] = new Map(snapshot.docs.map((item) => [item.id, item]));
       const uniqueMessages = new Map();
       snapshots.forEach((items) => items.forEach((item, id) => uniqueMessages.set(id, item)));
@@ -68,8 +67,8 @@ export function subscribeToConversations(userId, onConversations, onError) {
           onError?.(new Error(error.message || 'Could not load conversations.'));
         });
     }, (error) => {
-      console.error('Conversation subscription error:', error);
-      onError?.(new Error(error.message || 'Could not subscribe to conversations.'));
+      console.error(`Conversation subscription error (${name}):`, error.code, error);
+      onError?.(new Error(`${name}: ${error.code || 'firestore/error'}: ${error.message || 'Could not subscribe to conversations.'}`));
     }))
     return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
   } catch (error) {
@@ -82,7 +81,6 @@ export function subscribeToConversations(userId, onConversations, onError) {
 export async function getConversations(userId) {
   try {
     const messageQueries = [
-      query(collection(db, 'messages'), where('participants', 'array-contains', userId)),
       query(collection(db, 'messages'), where('senderId', '==', userId)),
       query(collection(db, 'messages'), where('recipientId', '==', userId)),
     ];

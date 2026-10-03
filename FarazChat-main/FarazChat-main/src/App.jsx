@@ -1,7 +1,7 @@
 import { searchUserByCode, getMyProfile, updateUserProfile } from './lib/users';
 import { registerUser, loginUser, logoutUser, changeUserPassword, onAuthChange, isCodeAvailable } from './lib/auth';
 import { subscribeToConversations } from './lib/conversations';
-import { markMessagesAsRead, sendTextMessage, subscribeToMessages } from './lib/messages';
+import { editMessage, markMessagesAsRead, sendTextMessage, subscribeToMessages, toggleMessageReaction } from './lib/messages';
 import {
   addGroupMember as addFirestoreGroupMember,
   createGroup,
@@ -25,9 +25,9 @@ import {
 import { subscribeToOnlineUsers, updateLastSeen } from './lib/presence';
 import { useEffect, useRef, useState } from 'react';
 import {
-  ArrowLeft, Bell, Camera, Check, CheckCheck, Download, Eye, FileText, Heart, ImagePlus, KeyRound, LockKeyhole,
-  LogOut, MessageCircle, Mic, Moon, Paperclip, Pause, Play, Plus, Search, Send, Settings, Shield, ShieldCheck,
-  Smile, UserRound, UsersRound, X,
+  ArrowLeft, Bell, Camera, Check, CheckCheck, Copy, Download, Eye, FileText, Forward, Heart, ImagePlus, KeyRound, LockKeyhole,
+  LogOut, MessageCircle, Mic, Moon, MoreHorizontal, Paperclip, Pause, Pencil, Play, Plus, Reply, Search, Send, Settings,
+  Shield, ShieldCheck, Smile, UserRound, UsersRound, X,
 } from 'lucide-react';
 
 const CHAT_WALLPAPER_KEY = 'farazchat-chat-wallpaper';
@@ -199,7 +199,7 @@ function AttachmentCard() {
   return <div className="attachment-unavailable">Attachments are not supported yet.</div>;
 }
 
-function ContactProfileModal({ person, online, savedName, onClose, onSaveContact }) {
+function ContactProfileModal({ person, online, savedName, isBlocked, onClose, onSaveContact, onToggleBlock }) {
   const [nickname, setNickname] = useState(savedName || person.saved_as || person.display_name || person.username);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -223,6 +223,18 @@ function ContactProfileModal({ person, online, savedName, onClose, onSaveContact
     }
   }
 
+  async function toggleBlock() {
+    setBusy(true);
+    setError('');
+    try {
+      await onToggleBlock(person);
+    } catch (requestError) {
+      setError(requestError.message || 'Could not update the block list.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="modal-scrim" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="contact-profile-modal" role="dialog" aria-modal="true" aria-label={`${person.profile_name || person.display_name || person.username} profile`}>
@@ -233,6 +245,7 @@ function ContactProfileModal({ person, online, savedName, onClose, onSaveContact
         <span className={`contact-profile-status${online ? ' contact-is-online' : ''}`}><i />{online ? 'Online' : 'Offline'}</span>
         <p>{person.bio || 'No bio yet.'}</p>
         <form className="save-contact-form" onSubmit={saveContact}><label htmlFor="saved-contact-name">Save this contact as</label><input id="saved-contact-name" className="profile-input" value={nickname} onChange={(event) => setNickname(event.target.value)} maxLength={40} required /><button className="primary-button" disabled={busy}>{busy ? 'Saving…' : savedName ? 'Update saved name' : 'Save contact'}</button>{error && <span className="form-error" role="alert">{error}</span>}</form>
+        <button type="button" className="contact-block-button" onClick={toggleBlock} disabled={busy}>{isBlocked ? 'Unblock member' : 'Block member'}</button>
       </section>
     </div>
   );
@@ -643,11 +656,41 @@ function GroupModal({ user, onClose, onCreate }) {
 
 function StatusComposerModal({ user, onClose, onPublished }) {
   const [body, setBody] = useState('');
+  const [media, setMedia] = useState(null);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const textareaRef = useRef(null);
   const emojis = ['😀', '😂', '😍', '🥰', '😎', '🎉', '❤️', '🔥', '🙏', '✨', '👍', '😊'];
+
+  async function selectStatusMedia(event) {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    setError('');
+    try {
+      if (file.type.startsWith('image/')) {
+        if (file.size > 8 * 1024 * 1024) throw new Error('Choose an image under 8 MB.');
+        const mediaBase64 = await compressImage(file);
+        if (mediaBase64.length > 750_000) throw new Error('Choose a smaller image.');
+        setMedia({ mediaBase64, mediaType: 'image/jpeg', mediaName: file.name, previewUrl: `data:image/jpeg;base64,${mediaBase64}` });
+        return;
+      }
+      if (!['video/mp4', 'video/webm'].includes(file.type)) throw new Error('Choose a JPEG, PNG, WebP, MP4, or WebM file.');
+      if (file.size > 550_000) throw new Error('Videos must be under 550 KB on the free plan.');
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error('Could not read that video.'));
+        reader.readAsDataURL(file);
+      });
+      const mediaBase64 = String(dataUrl).split(',')[1] || '';
+      if (mediaBase64.length > 750_000) throw new Error('Choose a shorter video.');
+      setMedia({ mediaBase64, mediaType: file.type, mediaName: file.name, previewUrl: dataUrl });
+    } catch (mediaError) {
+      setError(mediaError.message || 'Could not prepare that media.');
+    }
+  }
 
   function insertEmoji(emoji) {
     const textarea = textareaRef.current;
@@ -665,14 +708,14 @@ function StatusComposerModal({ user, onClose, onPublished }) {
 
   async function submit(event) {
     event.preventDefault();
-    if (!body.trim()) {
-      setError('Write something before sharing your status.');
+    if (!body.trim() && !media) {
+      setError('Write something or choose media before sharing your status.');
       return;
     }
     setBusy(true);
     setError('');
     try {
-      await publishFirestoreStatus(user, body);
+      await publishFirestoreStatus(user, body, media);
       onPublished();
     } catch (requestError) {
       setError(requestError.message);
@@ -688,6 +731,8 @@ function StatusComposerModal({ user, onClose, onPublished }) {
         <form className="status-composer-form" onSubmit={submit}>
           <div className="status-text-heading"><label htmlFor="status-text">Your update</label><button type="button" className="icon-button" onClick={() => setEmojiOpen((open) => !open)} aria-label="Add emoji" title="Add emoji"><Smile size={19} /></button></div>
           <textarea ref={textareaRef} id="status-text" value={body} onChange={(event) => setBody(event.target.value)} maxLength={700} placeholder="What’s happening?" aria-label="Status text" />
+          <label className="status-media-picker"><ImagePlus size={16} /> Add photo or short video<input type="file" accept="image/jpeg,image/png,image/webp,video/mp4,video/webm" onChange={selectStatusMedia} /></label>
+          {media && <div className="status-media-preview">{media.mediaType.startsWith('video/') ? <video src={media.previewUrl} controls playsInline /> : <img src={media.previewUrl} alt="Status preview" />}<button type="button" className="icon-button" onClick={() => setMedia(null)} aria-label="Remove status media"><X size={15} /></button></div>}
           {emojiOpen && <div className="status-emoji-picker" aria-label="Choose an emoji">{emojis.map((emoji) => <button key={emoji} type="button" onClick={() => insertEmoji(emoji)} aria-label={`Insert ${emoji}`}>{emoji}</button>)}</div>}
           <div className="status-composer-actions"><span>{body.length}/700</span><button className="primary-button" disabled={busy}>{busy ? 'Sharing…' : 'Share status'}</button></div>
           {error && <p className="form-error" role="alert">{error}</p>}
@@ -779,7 +824,7 @@ function StatusViewerModal({ user, update, onClose, onDelete, onOpenChat, initia
       <section className="status-viewer" role="dialog" aria-modal="true" aria-label={`${update.user.display_name}'s status`}>
         <header><Avatar name={update.user.display_name || update.user.username} src={update.user.avatar_url} /><span><strong>{update.own ? 'My status' : update.user.display_name || update.user.username}</strong><small>{new Date(status.created_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</small></span><button className="icon-button" onClick={onClose} aria-label="Close status"><X size={19} /></button></header>
         <div className="status-progress"><i style={{ width: `${((index + 1) / update.statuses.length) * 100}%` }} /></div>
-        <main>{status.body && <p>{status.body}</p>}</main>
+        <main>{status.media_url && (status.media_type.startsWith('video/') ? <video className="status-media-viewer" src={status.media_url} controls playsInline /> : <img className="status-media-viewer" src={status.media_url} alt="Status media" />)}{status.body && <p>{status.body}</p>}</main>
         <section className="status-interactions" aria-label="Status interactions">
           <div className="status-reaction-row"><button className={`status-like-button${interactions?.liked ? ' is-liked' : ''}`} onClick={toggleLike} disabled={!interactions || savingInteraction} aria-pressed={Boolean(interactions?.liked)}><Heart size={17} fill={interactions?.liked ? 'currentColor' : 'none'} />{interactions?.likes_count ?? status.likes_count ?? 0}</button><span className="status-view-count"><Eye size={16} />{interactions?.views_count ?? status.views_count ?? 0} views</span></div>
           {update.own && interactions?.viewers.length > 0 && <div className="status-viewer-list"><strong>Seen by</strong>{interactions.viewers.map((viewer) => <span key={viewer.id}><Avatar name={viewer.display_name || viewer.username} src={viewer.avatar_url} />{viewer.display_name || viewer.username}</span>)}</div>}
@@ -807,6 +852,40 @@ function StatusActivityModal({ notifications, onClose, onOpenStatus }) {
             <span className={`status-activity-kind status-activity-${notification.kind}`}>{notification.kind === 'view' ? <Eye size={16} /> : notification.kind === 'like' ? <Heart size={16} /> : <MessageCircle size={16} />}</span>
           </button>;
         })}</div> : <div className="status-activity-empty"><Bell size={22} /><strong>All caught up</strong><span>Status views, likes, and replies will show here.</span></div>}
+      </section>
+    </div>
+  );
+}
+
+function ForwardMessageModal({ message, conversations, groups, onClose, onForward }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const destinations = [
+    ...conversations.map((person) => ({ ...person, kind: 'direct', destinationName: person.display_name || person.username })),
+    ...groups.map((group) => ({ ...group, kind: 'group', destinationName: group.name })),
+  ];
+
+  async function forwardTo(destination) {
+    setBusy(true);
+    setError('');
+    try {
+      await onForward(message, destination);
+      onClose();
+    } catch (forwardError) {
+      setError(forwardError.message || 'Could not forward this message.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="modal-scrim" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="new-chat-modal forward-message-modal" role="dialog" aria-modal="true" aria-labelledby="forward-message-title">
+        <div className="modal-heading"><div><span className="modal-kicker">SHARE A MESSAGE</span><h2 id="forward-message-title">Forward to…</h2></div><button className="icon-button" onClick={onClose} aria-label="Close forwarding"><X size={19} /></button></div>
+        <blockquote>{message.body}</blockquote>
+        <div className="forward-destinations">{destinations.map((destination) => <button key={`${destination.kind}-${destination.id}`} className="result-user" onClick={() => forwardTo(destination)} disabled={busy}><Avatar name={destination.destinationName} src={destination.kind === 'group' ? destination.avatar_url : destination.avatar_url} /><span className="result-user-name"><strong>{destination.destinationName}</strong><span>{destination.kind === 'group' ? 'Group' : `#${destination.contact_code || destination.username}`}</span></span><Forward size={16} /></button>)}</div>
+        {!destinations.length && <p className="search-empty">There are no existing chats to forward to.</p>}
+        {error && <p className="form-error" role="alert">{error}</p>}
       </section>
     </div>
   );
@@ -954,6 +1033,7 @@ function SettingsModal({ user, initialSection, chatWallpaper, onWallpaperChange,
   const [bio, setBio] = useState(user.bio || '');
   const [notificationsEnabled, setNotificationsEnabled] = useState(Boolean(user.notifications_enabled));
   const [discoverable, setDiscoverable] = useState(user.discoverable !== false);
+  const [allowMessages, setAllowMessages] = useState(user.allow_messages !== false);
   const [photoPreview, setPhotoPreview] = useState(user.avatar_url || '');
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -1007,6 +1087,7 @@ function SettingsModal({ user, initialSection, chatWallpaper, onWallpaperChange,
         bio: includeProfile ? bio : user.bio || '',
         notificationsEnabled: changes.notificationsEnabled ?? notificationsEnabled,
         discoverable: changes.discoverable ?? discoverable,
+        allowMessages: changes.allowMessages ?? allowMessages,
       });
       onSave(profile);
       setNotice('Settings saved.');
@@ -1029,6 +1110,13 @@ function SettingsModal({ user, initialSection, chatWallpaper, onWallpaperChange,
     const previous = discoverable;
     setDiscoverable(nextValue);
     if (!(await persistSettings({ discoverable: nextValue }))) setDiscoverable(previous);
+  }
+
+  async function changeAllowMessages(event) {
+    const nextValue = event.target.checked;
+    const previous = allowMessages;
+    setAllowMessages(nextValue);
+    if (!(await persistSettings({ allowMessages: nextValue }))) setAllowMessages(previous);
   }
 
   function chooseWallpaper(value) {
@@ -1138,7 +1226,7 @@ function SettingsModal({ user, initialSection, chatWallpaper, onWallpaperChange,
             <div className="settings-field"><label htmlFor="edit-bio">Bio</label><textarea className="profile-textarea" id="edit-bio" value={bio} onChange={(event) => setBio(event.target.value)} placeholder="A little about you" maxLength={160} /><span className="bio-counter">{bio.length}/160</span></div>
             <button className="primary-button settings-save" disabled={busy}>{busy ? 'Saving…' : 'Save profile'}</button>
           </form>}
-          {section === 'privacy' && <div className="settings-panel"><div className="settings-row"><span className="setting-icon"><Search size={17} /></span><span className="notification-setting-copy"><strong>Find me by contact code</strong><span>{discoverable ? 'Other members can find you using your full 8-digit code.' : 'You will not appear in code search.'}</span></span><label className="switch-control" aria-label="Find me by contact code"><input type="checkbox" checked={discoverable} onChange={changeDiscoverability} disabled={busy} /><span className="switch-track" /></label></div></div>}
+          {section === 'privacy' && <div className="settings-panel"><div className="settings-row"><span className="setting-icon"><Search size={17} /></span><span className="notification-setting-copy"><strong>Find me by contact code</strong><span>{discoverable ? 'Other members can find you using your full 8-digit code.' : 'You will not appear in code search.'}</span></span><label className="switch-control" aria-label="Find me by contact code"><input type="checkbox" checked={discoverable} onChange={changeDiscoverability} disabled={busy} /><span className="switch-track" /></label></div><div className="settings-row"><span className="setting-icon"><MessageCircle size={17} /></span><span className="notification-setting-copy"><strong>Allow direct messages</strong><span>{allowMessages ? 'Members can send you direct messages unless blocked.' : 'New direct messages are disabled until you turn this on.'}</span></span><label className="switch-control" aria-label="Allow direct messages"><input type="checkbox" checked={allowMessages} onChange={changeAllowMessages} disabled={busy} /><span className="switch-track" /></label></div></div>}
           {section === 'notifications' && <div className="settings-panel"><div className="settings-row"><span className="setting-icon"><Bell size={17} /></span><span className="notification-setting-copy"><strong>Desktop message notifications</strong><span>Show alerts when the app is open but the conversation is not active. Browser permission is required.</span></span><label className="switch-control" aria-label="Message notifications"><input type="checkbox" checked={notificationsEnabled} onChange={requestNotifications} disabled={busy} /><span className="switch-track" /></label></div></div>}
           {section === 'appearance' && <div className="settings-panel"><div className="settings-row"><span className="setting-icon"><Moon size={17} /></span><span className="notification-setting-copy"><strong>Dark theme</strong><span>Use the same theme across all accounts on this device.</span></span><label className="switch-control" aria-label="Dark theme"><input type="checkbox" checked={theme === 'dark'} onChange={changeTheme} /><span className="switch-track" /></label></div></div>}
           {section === 'wallpaper' && <div className="wallpaper-settings"><div className="wallpaper-choices">{[{ id: 'paper', label: 'Soft paper' }, { id: 'grid', label: 'Fine grid' }, { id: 'sage', label: 'Sage dots' }].map((wallpaper) => <button key={wallpaper.id} type="button" className={`wallpaper-choice wallpaper-choice-${wallpaper.id}${chatWallpaper === wallpaper.id ? ' is-selected' : ''}`} onClick={() => chooseWallpaper(wallpaper.id)} aria-pressed={chatWallpaper === wallpaper.id}><span className="wallpaper-swatch" /><strong>{wallpaper.label}</strong></button>)}</div><div className="wallpaper-actions"><label className="photo-pick-button" title="Choose a chat background from your gallery"><ImagePlus size={15} /> Choose from gallery<input type="file" accept="image/*" onChange={selectWallpaperFile} disabled={busy} /></label>{chatWallpaper !== 'paper' && <button className="secondary-button" type="button" onClick={() => chooseWallpaper('paper')} disabled={busy}>Reset</button>}</div></div>}
@@ -1164,6 +1252,10 @@ function App() {
   const [statusUpdates, setStatusUpdates] = useState([]);
   const [active, setActive] = useState(null);
   const [messages, setMessages] = useState([]);
+  const [replyingTo, setReplyingTo] = useState(null);
+  const [editingMessageId, setEditingMessageId] = useState(null);
+  const [messageActionMenuId, setMessageActionMenuId] = useState(null);
+  const [forwardingMessage, setForwardingMessage] = useState(null);
   const [groupMembersById, setGroupMembersById] = useState(() => new Map());
   const [draft, setDraft] = useState('');
   const [filter, setFilter] = useState('');
@@ -1363,6 +1455,15 @@ function App() {
     setUser(profile);
     setConversations((current) => current.map((person) => person.id === profile.id ? { ...person, ...profile } : person));
     setActive((current) => current?.id === profile.id ? { ...current, ...profile } : current);
+  }
+
+  async function toggleBlockedUser(person) {
+    const blockedUserIds = user.blocked_user_ids || [];
+    const nextBlockedIds = blockedUserIds.includes(person.id)
+      ? blockedUserIds.filter((blockedId) => blockedId !== person.id)
+      : [...blockedUserIds, person.id];
+    const profile = await updateUserProfile(user.id, { blockedUserIds: nextBlockedIds });
+    updateProfile(profile);
   }
 
   async function saveContact(person, nickname) {
@@ -1623,10 +1724,28 @@ function App() {
 
   async function sendMessageContent(body) {
     if (!body || !active || sendingMessage) return;
+    if (!canSendToActive) {
+      setError(user.blocked_user_ids?.includes(active.id) || active.blocked_user_ids?.includes(user.id)
+        ? 'Direct messages are blocked.'
+        : 'This member does not accept new messages.');
+      return;
+    }
     setDraft('');
     setSendingMessage(true);
     try {
-      await sendTextMessage({ chat: active, sender: user, body });
+      if (editingMessageId) {
+        await editMessage(editingMessageId, user.id, body);
+        setEditingMessageId(null);
+      } else {
+        const replyTo = replyingTo ? {
+          id: replyingTo.id,
+          body: replyingTo.body,
+          senderId: replyingTo.senderId || replyingTo.sender_id,
+          senderDisplayName: replyingTo.senderDisplayName || replyingTo.sender_display_name || replyingTo.sender_username,
+        } : null;
+        await sendTextMessage({ chat: active, sender: user, body, replyTo });
+        setReplyingTo(null);
+      }
     } catch (sendError) {
       setDraft(body);
       setError(sendError.message);
@@ -1640,11 +1759,58 @@ function App() {
     sendMessageContent(draft.trim());
   }
 
+  function startReply(message) {
+    setReplyingTo(message);
+    setEditingMessageId(null);
+    setDraft('');
+    setMessageActionMenuId(null);
+  }
+
+  function startEdit(message) {
+    setReplyingTo(null);
+    setEditingMessageId(message.id);
+    setDraft(message.body || '');
+    setMessageActionMenuId(null);
+  }
+
+  async function copyMessage(message) {
+    try {
+      await navigator.clipboard.writeText(message.body || '');
+      setMessageActionMenuId(null);
+      setError('');
+    } catch {
+      setError('Clipboard access is unavailable in this browser.');
+    }
+  }
+
+  async function reactToMessage(message, emoji) {
+    setMessageActionMenuId(null);
+    try {
+      await toggleMessageReaction(message.id, user.id, emoji);
+    } catch (reactionError) {
+      setError(reactionError.message);
+    }
+  }
+
+  async function forwardMessage(message, destination) {
+    const senderName = message.senderDisplayName || message.sender_display_name || message.sender_username || 'A member';
+    await sendTextMessage({
+      chat: destination,
+      sender: user,
+      body: message.body || '',
+      forwardedFrom: { senderName },
+    });
+  }
+
   const filteredConversations = conversations.filter((conversation) =>
     `${conversation.display_name || ''} ${conversation.username}`.toLowerCase().includes(filter.toLowerCase()));
   const filteredGroups = groups.filter((group) => group.name.toLowerCase().includes(filter.toLowerCase()));
   const customChatWallpaper = chatWallpaper.startsWith('data:image/jpeg;base64,');
   const wallpaperPreset = ['paper', 'grid', 'sage'].includes(chatWallpaper) ? chatWallpaper : 'paper';
+  const canSendToActive = active?.kind === 'group' || Boolean(active
+    && active.allow_messages !== false
+    && !user?.blocked_user_ids?.includes(active.id)
+    && !active.blocked_user_ids?.includes(user?.id));
 
   if (loading) return <main className="loading-screen"><div className="loading-mark"><MessageCircle size={23} /></div><span>Opening your chats…</span></main>;
   if (!user) return <AuthScreen onLogin={handleLogin} />;
@@ -1671,9 +1837,9 @@ function App() {
           {inboxView === 'groups' && filteredGroups.map((group) => <button key={group.id} className={`conversation-item group-conversation${active?.kind === 'group' && active.id === group.id ? ' conversation-active' : ''}`} onClick={() => chooseGroup(group)}><span className="group-avatar">{group.avatar_url ? <Avatar name={group.name} src={group.avatar_url} /> : <UsersRound size={18} />}</span><span className="conversation-copy"><span className="conversation-top"><strong>{group.name}</strong><time>{relativeTime(group.last_message_at)}</time></span><span className="conversation-bottom"><span>{group.last_message || group.bio || `${group.member_count} members`}</span></span></span></button>)}
           {inboxView === 'status' && <div className="status-list"><button className="status-list-item my-status-item" onClick={() => { const ownStatus = statusUpdates.find((update) => update.own); if (ownStatus) { setActiveStatus(ownStatus); setActiveStatusId(null); } else setStatusComposerOpen(true); }}><span className="status-ring status-add-ring"><Avatar name={user.display_name || user.username} src={user.avatar_url} /><i>+</i></span><span><strong>My status</strong><small>{statusUpdates.find((update) => update.own)?.statuses.length ? `${statusUpdates.find((update) => update.own).statuses.length} updates · tap to view` : 'Share a photo or update'}</small></span><span className="status-add-control" aria-hidden="true"><Plus size={17} /></span></button>{statusUpdates.filter((update) => !update.own).map((update) => <button className="status-list-item" key={update.user.id} onClick={() => { setActiveStatus(update); setActiveStatusId(null); }}><span className={`status-ring${update.statuses.some((status) => !status.viewed) ? ' status-unviewed' : ''}`}><Avatar name={update.user.display_name || update.user.username} src={update.user.avatar_url} /></span><span><strong>{update.user.display_name || update.user.username}</strong><small>{update.statuses.length} update{update.statuses.length === 1 ? '' : 's'} · {relativeTime(new Date(update.statuses[0].created_at).toISOString().slice(0, 19).replace('T', ' '))}</small></span></button>)}</div>}
           {inboxView === 'chats' && filteredConversations.length === 0 && <div className="inbox-empty"><span className="empty-art"><MessageCircle size={24} /></span><strong>{filter ? 'No matches' : 'A little quiet here'}</strong><span>{filter ? 'Try a different name.' : 'Start a conversation with someone.'}</span>{!filter && <button onClick={() => setModalOpen(true)}>Find someone <span>↗</span></button>}</div>}
-          {inboxView === 'groups' && filteredGroups.length === 0 && <div className="inbox-empty"><span className="empty-art"><UsersRound size={24} /></span><strong>{filter ? 'No matches' : 'No groups yet'}</strong><span>{filter ? 'Try another group name.' : 'Bring people together in a group.'}</span>{!filter && <button onClick={() => setGroupModalOpen(true)}>Create group <span>↗</span></button>}</div>}
+          {inboxView === 'groups' && filteredGroups.length === 0 && <div className="inbox-empty"><span className="empty-art"><UsersRound size={24} /></span><strong>{filter ? 'No matches' : 'No groups yet'}</strong><span>{filter ? 'Try another group name.' : 'Bring people together in a group.'}</span></div>}
         </div>
-        <button className="profile-footer profile-edit-button" onClick={() => openSettings('profile')} title="Edit profile"><Avatar name={user.display_name || user.username} src={user.avatar_url} /><span className="profile-name"><strong>{user.display_name || user.username}</strong><span>#{user.contact_code || user.username}</span></span><Settings size={16} /></button>
+        <div className="profile-footer profile-identity"><Avatar name={user.display_name || user.username} src={user.avatar_url} /><span className="profile-name"><strong>{user.display_name || user.username}</strong><span>#{user.contact_code || user.username}</span></span></div>
       </aside>
 
       <section className={`chat-panel${mobileChat ? ' chat-mobile-visible' : ''}`}>
@@ -1690,20 +1856,48 @@ function App() {
               const showAuthor = !previous || previous.sender_id !== message.sender_id;
               const senderProfile = active.kind === 'group' ? groupMembersById.get(message.sender_id) : null;
               const senderName = senderProfile?.display_name || senderProfile?.username || message.sender_display_name || message.sender_username;
+              const reactions = Object.entries(message.reactionsByUser || {}).reduce((counts, [reactorId, emoji]) => {
+                counts[emoji] ||= { count: 0, mine: false };
+                counts[emoji].count += 1;
+                counts[emoji].mine ||= reactorId === user.id;
+                return counts;
+              }, {});
               return <div className={`message-row${mine ? ' message-mine' : ''}${showAuthor ? ' message-first' : ''}`} data-message-id={message.id} key={message.id}>
                 {active.kind === 'group' && !mine && <span className="message-group-avatar"><Avatar name={senderName} src={senderProfile?.avatar_url || ''} /></span>}
-                <div className="message-stack">{active.kind === 'group' && showAuthor && !mine && <span className="group-message-author">{senderName}</span>}{message.body && <div className="message-bubble">{message.body}</div>}<span className="message-time">{relativeTime(message.created_at)}{mine && <span className={`message-read-receipt${messageSeen ? ' is-read' : messageDelivered ? ' is-delivered' : ''}`} title={active.kind === 'group' ? `${message.delivered_count || 0} delivered · ${message.read_count || 0} seen` : messageSeen ? 'Seen' : messageDelivered ? 'Delivered' : 'Sent'}>{active.kind === 'group' && message.read_count > 0 && <small>{message.read_count}/{message.recipient_count}</small>}{messageSeen || messageDelivered ? <CheckCheck size={14} /> : <Check size={13} />}</span>}</span></div>
+                <div className="message-stack">
+                  {active.kind === 'group' && showAuthor && !mine && <span className="group-message-author">{senderName}</span>}
+                  <div className="message-content-frame">
+                    {message.body && <div className="message-bubble">
+                      {message.forwardedFrom && <span className="message-forwarded-label"><Forward size={12} /> Forwarded from {message.forwardedFrom.senderName || 'a member'}</span>}
+                      {message.replyTo && <span className="message-reply-quote"><strong>{message.replyTo.senderDisplayName || 'Message'}</strong><span>{message.replyTo.body}</span></span>}
+                      {message.body}
+                      {message.editedAt && <small className="message-edited-label">edited</small>}
+                    </div>}
+                    {Object.keys(reactions).length > 0 && <div className="message-reactions">{Object.entries(reactions).map(([emoji, reaction]) => <button type="button" key={emoji} className={`message-reaction${reaction.mine ? ' is-mine' : ''}`} onClick={() => reactToMessage(message, emoji)} aria-label={`${emoji}, ${reaction.count} reactions`}>{emoji} <small>{reaction.count}</small></button>)}</div>}
+                    <span className="message-time">{relativeTime(message.created_at)}{mine && <span className={`message-read-receipt${messageSeen ? ' is-read' : messageDelivered ? ' is-delivered' : ''}`} title={active.kind === 'group' ? `${message.delivered_count || 0} delivered · ${message.read_count || 0} seen` : messageSeen ? 'Seen' : messageDelivered ? 'Delivered' : 'Sent'}>{active.kind === 'group' && message.read_count > 0 && <small>{message.read_count}/{message.recipient_count}</small>}{messageSeen || messageDelivered ? <CheckCheck size={14} /> : <Check size={13} />}</span>}</span>
+                    <button className="message-action-trigger" type="button" onClick={() => setMessageActionMenuId((current) => current === message.id ? null : message.id)} aria-label="Message actions" title="Message actions"><MoreHorizontal size={16} /></button>
+                    {messageActionMenuId === message.id && <div className="message-action-menu">
+                      <button type="button" onClick={() => startReply(message)}><Reply size={14} /> Reply</button>
+                      <button type="button" onClick={() => copyMessage(message)}><Copy size={14} /> Copy</button>
+                      {mine && <button type="button" onClick={() => startEdit(message)}><Pencil size={14} /> Edit</button>}
+                      <button type="button" onClick={() => { setForwardingMessage(message); setMessageActionMenuId(null); }}><Forward size={14} /> Forward</button>
+                      <div className="message-reaction-picker">{['👍', '❤️', '😂', '😮', '😢', '🙏'].map((emoji) => <button type="button" key={emoji} onClick={() => reactToMessage(message, emoji)} aria-label={`React ${emoji}`}>{emoji}</button>)}</div>
+                    </div>}
+                  </div>
+                </div>
                 {active.kind === 'group' && mine && <span className="message-group-avatar"><Avatar name={senderName} src={senderProfile?.avatar_url || ''} /></span>}
               </div>;
             })}
             <div ref={messageEndRef} />
           </div>
           {error && <div className="chat-error" role="alert">{error}<button onClick={() => setError('')} aria-label="Dismiss"><X size={14} /></button></div>}
+          {(replyingTo || editingMessageId) && <div className="message-composer-context"><span><strong>{editingMessageId ? 'Edit message' : `Reply to ${replyingTo.senderDisplayName || replyingTo.sender_display_name || replyingTo.sender_username || 'message'}`}</strong><small>{editingMessageId ? 'Only your own message can be edited.' : replyingTo.body}</small></span><button type="button" onClick={() => { setReplyingTo(null); setEditingMessageId(null); setDraft(''); }} aria-label="Cancel reply or edit"><X size={15} /></button></div>}
           <form className="composer" onSubmit={sendMessage}>
             <input value={draft} onChange={(event) => updateDraft(event.target.value)} placeholder={`Message ${active.kind === 'group' ? active.name : active.display_name || active.username}…`} maxLength={4000} aria-label="Message" />
             <span className="composer-divider" />
-            <button type="submit" className="send-button" disabled={!draft.trim() || sendingMessage} aria-label="Send message" title="Send message"><Send size={17} /></button>
+            <button type="submit" className="send-button" disabled={!draft.trim() || sendingMessage || !canSendToActive} aria-label="Send message" title="Send message"><Send size={17} /></button>
           </form>
+          {!canSendToActive && active.kind !== 'group' && <div className="chat-message-restriction">{user.blocked_user_ids?.includes(active.id) || active.blocked_user_ids?.includes(user.id) ? 'Direct messages are blocked.' : 'This member does not accept new messages.'}</div>}
           <div className="chat-privacy"><LockKeyhole size={12} /> Messages are stored in your Firebase account.</div>
         </> : <div className="welcome-panel"><div className="welcome-illustration"><div className="welcome-orbit orbit-one" /><div className="welcome-orbit orbit-two" /><span className="welcome-icon"><MessageCircle size={35} /></span><span className="orbit-dot dot-one" /><span className="orbit-dot dot-two" /><span className="orbit-dot dot-three" /></div><span className="welcome-eyebrow">A SPACE OF YOUR OWN</span><h2>Make room for<br />a good <span>conversation.</span></h2><p>Choose someone you know, or find a new face by their username.</p><button className="primary-button welcome-button" onClick={() => setModalOpen(true)}><Plus size={17} /> Start a new chat</button><span className="welcome-bottom"><Check size={14} /> Your messages, delivered in real time</span></div>}
       </section>
@@ -1713,8 +1907,9 @@ function App() {
       {activityOpen && <StatusActivityModal notifications={statusNotifications} onClose={() => setActivityOpen(false)} onOpenStatus={openNotifiedStatus} />}
       {activeStatus && <StatusViewerModal key={`${activeStatus.user.id}-${activeStatusId || activeStatus.statuses[0]?.id}`} user={user} update={activeStatus} initialStatusId={activeStatusId} onClose={() => { setActiveStatus(null); setActiveStatusId(null); }} onOpenChat={(person) => { setActiveStatus(null); setActiveStatusId(null); chooseConversation(person); }} onDelete={removeStatus} />}
       {groupDetailsOpen && active?.kind === 'group' && <GroupDetailsModal group={active} currentUser={user} onClose={() => setGroupDetailsOpen(false)} onUpdate={updateGroupProfile} onAddMember={addGroupMember} onRemoveMember={removeGroupMember} onLeave={leaveCurrentGroup} />}
+      {forwardingMessage && <ForwardMessageModal message={forwardingMessage} conversations={conversations} groups={groups} onClose={() => setForwardingMessage(null)} onForward={forwardMessage} />}
       {settingsOpen && <SettingsModal user={user} initialSection={settingsSection} chatWallpaper={chatWallpaper} onWallpaperChange={setChatWallpaper} theme={theme} onThemeChange={setTheme} onClose={() => setSettingsOpen(false)} onSave={updateProfile} onSignOut={signOut} />}
-      {contactProfileOpen && active && <ContactProfileModal person={active} online={onlineUsers.has(active.id)} savedName={contacts.find((contact) => contact.id === active.id)?.nickname || active.saved_as} onSaveContact={saveContact} onClose={() => setContactProfileOpen(false)} />}
+      {contactProfileOpen && active && <ContactProfileModal person={active} online={onlineUsers.has(active.id)} savedName={contacts.find((contact) => contact.id === active.id)?.nickname || active.saved_as} isBlocked={Boolean(user.blocked_user_ids?.includes(active.id))} onToggleBlock={toggleBlockedUser} onSaveContact={saveContact} onClose={() => setContactProfileOpen(false)} />}
     </main>
   );
 }

@@ -1,4 +1,4 @@
-import { addDoc, collection, doc, onSnapshot, query, serverTimestamp, updateDoc, where, writeBatch } from 'firebase/firestore';
+import { addDoc, collection, doc, onSnapshot, query, runTransaction, serverTimestamp, setDoc, updateDoc, where, writeBatch } from 'firebase/firestore';
 import { db } from '../firebase';
 
 export function directConversationId(firstId, secondId) {
@@ -41,8 +41,8 @@ function matchesDirectChat(data, currentUserId, chatId) {
 
 export function subscribeToMessages(chat, currentUser, onMessages, onError) {
   try {
-    const reportError = (error) => {
-      console.error('Message subscription error:', error.code, error);
+    const reportError = (queryName, error) => {
+      console.error(`Message subscription error (${queryName}):`, error.code, error);
       onError?.(new Error(`${error.code || 'firestore/error'}: ${error.message || 'Could not load messages.'}`));
     };
     if (chat.kind === 'group') {
@@ -50,16 +50,15 @@ export function subscribeToMessages(chat, currentUser, onMessages, onError) {
       return onSnapshot(groupQuery, (snapshot) => {
         onMessages(snapshot.docs.map(toMessage)
           .sort((left, right) => new Date(left.created_at) - new Date(right.created_at)));
-      }, reportError);
+      }, (error) => reportError('groupId', error));
     }
 
-    const messageQueries = [
-      query(collection(db, 'messages'), where('participants', 'array-contains', currentUser.id)),
+    const directMessagesQueries = [
       query(collection(db, 'messages'), where('senderId', '==', currentUser.id)),
       query(collection(db, 'messages'), where('recipientId', '==', currentUser.id)),
     ];
-    const snapshots = messageQueries.map(() => new Map());
-    const unsubscribe = messageQueries.map((messageQuery, index) => onSnapshot(messageQuery, (snapshot) => {
+    const snapshots = directMessagesQueries.map(() => new Map());
+    const unsubscribes = directMessagesQueries.map((directMessagesQuery, index) => onSnapshot(directMessagesQuery, (snapshot) => {
       snapshots[index] = new Map(snapshot.docs.map((item) => [item.id, item]));
       const uniqueMessages = new Map();
       snapshots.forEach((items) => items.forEach((item, id) => uniqueMessages.set(id, item)));
@@ -68,8 +67,8 @@ export function subscribeToMessages(chat, currentUser, onMessages, onError) {
         .map(toMessage)
         .sort((left, right) => new Date(left.created_at) - new Date(right.created_at));
       onMessages(matches);
-    }, reportError));
-    return () => unsubscribe.forEach((stop) => stop());
+    }, (error) => reportError('senderId/recipientId', error)));
+    return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
   } catch (error) {
     console.error('Message subscription setup error:', error);
     onError?.(new Error(error.message || 'Could not load messages.'));
@@ -101,7 +100,7 @@ export async function markMessagesAsRead(messages, currentUserId, chatId) {
   }
 }
 
-export async function sendTextMessage({ chat, sender, body }) {
+export async function sendTextMessage({ chat, sender, body, replyTo = null, forwardedFrom = null }) {
   try {
     const text = body.trim();
     if (!text) throw new Error('Write a message before sending.');
@@ -113,6 +112,8 @@ export async function sendTextMessage({ chat, sender, body }) {
       read: false,
       createdAt: serverTimestamp(),
     };
+    if (replyTo) payload.replyTo = replyTo;
+    if (forwardedFrom) payload.forwardedFrom = forwardedFrom;
     if (chat.kind === 'group') {
       payload.groupId = chat.id;
       payload.participants = chat.memberIds || chat.members?.map((member) => member.id) || [sender.id];
@@ -124,27 +125,71 @@ export async function sendTextMessage({ chat, sender, body }) {
     let reference;
     if (chat.kind === 'group') {
       reference = await addDoc(collection(db, 'messages'), payload);
-      await updateDoc(doc(db, 'groups', chat.id), {
-        lastMessage: text,
-        lastMessageAt: serverTimestamp(),
-      });
+      try {
+        await updateDoc(doc(db, 'groups', chat.id), {
+          lastMessage: text,
+          lastMessageAt: serverTimestamp(),
+        });
+      } catch (summaryError) {
+        console.warn('Group message saved, but its summary could not be updated:', summaryError);
+      }
     } else {
-      reference = doc(collection(db, 'messages'));
+      reference = await addDoc(collection(db, 'messages'), payload);
       const participants = [sender.id, chat.id].sort();
       const conversation = doc(db, 'conversations', directConversationId(sender.id, chat.id));
-      const batch = writeBatch(db);
-      batch.set(reference, payload);
-      batch.set(conversation, {
-        participants,
-        lastMessage: text,
-        lastMessageAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      }, { merge: true });
-      await batch.commit();
+      try {
+        await setDoc(conversation, {
+          participants,
+          lastMessage: text,
+          lastMessageAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        }, { merge: true });
+      } catch (summaryError) {
+        console.warn('Direct message saved, but its conversation summary could not be updated:', summaryError);
+      }
     }
     return { id: reference.id, ...payload, created_at: new Date().toISOString(), sender_id: sender.id, group_id: payload.groupId || null };
   } catch (error) {
     console.error('Message send error:', error);
     throw new Error(error.message || 'Could not send this message. Please try again.');
+  }
+}
+
+export async function editMessage(messageId, userId, body) {
+  try {
+    const text = body.trim();
+    if (!text) throw new Error('Message cannot be empty.');
+    const reference = doc(db, 'messages', messageId);
+    await runTransaction(db, async (transaction) => {
+      const snapshot = await transaction.get(reference);
+      if (!snapshot.exists() || snapshot.data().senderId !== userId) {
+        throw new Error('You can only edit your own messages.');
+      }
+      transaction.update(reference, { body: text, editedAt: serverTimestamp() });
+    });
+  } catch (error) {
+    console.error('Message edit error:', error);
+    throw new Error(error.message || 'Could not edit this message.');
+  }
+}
+
+export async function toggleMessageReaction(messageId, userId, emoji) {
+  try {
+    const allowedEmojis = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
+    if (!allowedEmojis.includes(emoji)) throw new Error('That reaction is not supported.');
+    const reference = doc(db, 'messages', messageId);
+    let nextReactions = {};
+    await runTransaction(db, async (transaction) => {
+      const snapshot = await transaction.get(reference);
+      if (!snapshot.exists()) throw new Error('Message not found.');
+      nextReactions = { ...(snapshot.data().reactionsByUser || {}) };
+      if (nextReactions[userId] === emoji) delete nextReactions[userId];
+      else nextReactions[userId] = emoji;
+      transaction.update(reference, { reactionsByUser: nextReactions });
+    });
+    return nextReactions;
+  } catch (error) {
+    console.error('Message reaction error:', error);
+    throw new Error(error.message || 'Could not update this reaction.');
   }
 }

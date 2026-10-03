@@ -28,7 +28,8 @@ function toStatus(snapshot) {
     viewed: false,
     likes_count: data.likes?.length || 0,
     views_count: data.viewedBy?.length || 0,
-    attachment: null,
+    media_url: data.mediaBase64 ? `data:${data.mediaType || 'image/jpeg'};base64,${data.mediaBase64}` : '',
+    media_type: data.mediaType || '',
   };
 }
 
@@ -60,16 +61,20 @@ function groupStatuses(docs, ownerId) {
   }));
 }
 
-export async function publishStatus(user, body) {
+export async function publishStatus(user, body, media = null) {
   try {
     const text = body.trim();
-    if (!text) throw new Error('Write something before sharing your status.');
+    if (!text && !media) throw new Error('Write something or choose media before sharing your status.');
+    if (media?.mediaBase64?.length > 750_000) throw new Error('Choose a smaller image or video (under 550 KB).');
     await addDoc(collection(db, 'statuses'), {
       ownerId: user.id,
       authorDisplayName: user.displayName || user.display_name || '',
       authorContactCode: user.contactCode || user.contact_code || '',
       authorAvatarBase64: user.avatarBase64 || '',
       body: text,
+      mediaBase64: media?.mediaBase64 || '',
+      mediaType: media?.mediaType || '',
+      mediaName: media?.mediaName || '',
       createdAt: serverTimestamp(),
       expiresAt: Timestamp.fromMillis(Date.now() + STATUS_LIFETIME_MS),
       likes: [],

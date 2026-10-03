@@ -26,6 +26,8 @@ export async function registerUser({ contactCode, password, displayName, bio }) 
       bio: bio || '',
       avatarBase64: '',
       discoverable: true,
+      allowMessages: true,
+      blockedUserIds: [],
       notificationsEnabled: false,
       lastSeen: serverTimestamp(),
       createdAt: serverTimestamp(),
