@@ -1071,6 +1071,8 @@ function App() {
   const [sendingMessage, setSendingMessage] = useState(false);
   const [error, setError] = useState('');
   const messageEndRef = useRef(null);
+  const messageStageRef = useRef(null);
+  const readReceiptInFlightRef = useRef(new Set());
   const photoInputRef = useRef(null);
   const fileInputRef = useRef(null);
   const recorderRef = useRef(null);
@@ -1143,9 +1145,41 @@ function App() {
   }, [active, user?.id]);
 
   useEffect(() => {
-    if (!active || active.kind === 'group' || !user || messages.length === 0) return;
-    markMessagesAsRead(messages, user.id, active.id)
-      .catch((loadError) => setError(loadError.message));
+    if (!active || active.kind === 'group' || !user || messages.length === 0) return undefined;
+    const stage = messageStageRef.current;
+    if (!stage || typeof IntersectionObserver === 'undefined') return undefined;
+
+    const observer = new IntersectionObserver((entries) => {
+      if (document.visibilityState !== 'visible') return;
+      const visibleEntries = entries.filter((entry) => entry.isIntersecting && entry.intersectionRatio >= 0.5);
+      const visibleUnreadMessages = visibleEntries
+        .map((entry) => messages.find((message) => message.id === entry.target.dataset.messageId))
+        .filter((message) => message
+          && message.read !== true
+          && (message.senderId || message.sender_id) === active.id
+          && (message.recipientId || message.recipient_id) === user.id
+          && !readReceiptInFlightRef.current.has(message.id));
+
+      if (!visibleUnreadMessages.length) return;
+      visibleUnreadMessages.forEach((message) => readReceiptInFlightRef.current.add(message.id));
+      markMessagesAsRead(visibleUnreadMessages, user.id, active.id)
+        .catch((loadError) => {
+          visibleUnreadMessages.forEach((message) => readReceiptInFlightRef.current.delete(message.id));
+          setError(loadError.message);
+        });
+    }, { root: stage, threshold: 0.5 });
+
+    const messageRows = [...stage.querySelectorAll('[data-message-id]')];
+    messageRows.forEach((row) => observer.observe(row));
+    function handleVisibilityChange() {
+      if (document.visibilityState === 'visible') messageRows.forEach((row) => observer.observe(row));
+      else observer.disconnect();
+    }
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      observer.disconnect();
+    };
   }, [active?.id, active?.kind, messages, user?.id]);
 
   useEffect(() => {
@@ -1479,7 +1513,7 @@ function App() {
       <section className={`chat-panel${mobileChat ? ' chat-mobile-visible' : ''}`}>
         {active ? <>
           <header className="chat-header"><button className="icon-button back-button" onClick={() => setMobileChat(false)} aria-label="Back to messages"><ArrowLeft size={19} /></button><button className="contact-profile-trigger" onClick={() => active.kind === 'group' ? setGroupDetailsOpen(true) : setContactProfileOpen(true)}><span className={active.kind === 'group' ? 'group-avatar chat-group-avatar' : ''}>{active.kind === 'group' ? <UsersRound size={19} /> : <Avatar name={active.display_name || active.username} src={active.avatar_url} />}</span><span className="chat-contact"><strong>{active.display_name || active.name || active.username}</strong><span className={`contact-status${active.kind !== 'group' && onlineUsers.has(active.id) ? ' is-online' : ''}`}><i />{contactTyping ? <>{typingName && `${typingName} `}typing<span className="typing-dots" aria-hidden="true"><i /><i /><i /></span></> : active.kind === 'group' ? `${active.member_count || active.members?.length || 0} members` : <>{onlineUsers.has(active.id) ? 'Online' : 'Offline'} · #{active.contact_code || active.username}</>}</span></span></button><button className="icon-button activity-button chat-activity-button" onClick={openStatusActivity} aria-label="Status activity" title="Status activity"><Bell size={18} />{statusNotifications.some((notification) => !notification.read_at) && <i>{statusNotifications.filter((notification) => !notification.read_at).length}</i>}</button><button className="chat-own-account" onClick={() => openSettings('profile')} aria-label={`Signed in as ${user.display_name || user.username}, code ${user.contact_code || user.username}`} title={`Signed in as ${user.display_name || user.username} · #${user.contact_code || user.username}`}><Avatar name={user.display_name || user.username} src={user.avatar_url} /><span><strong>{user.display_name || user.username}</strong><small>#{user.contact_code || user.username}</small></span></button></header>
-          <div className={`message-stage wallpaper-${customChatWallpaper ? 'custom' : wallpaperPreset}`} style={customChatWallpaper ? { '--chat-wallpaper-image': `url("${chatWallpaper}")` } : undefined}>
+          <div ref={messageStageRef} className={`message-stage wallpaper-${customChatWallpaper ? 'custom' : wallpaperPreset}`} style={customChatWallpaper ? { '--chat-wallpaper-image': `url("${chatWallpaper}")` } : undefined}>
             <div className="message-date"><span>YOUR CONVERSATION</span></div>
             {messages.length === 0 && <div className="first-message"><Avatar name={active.kind === 'group' ? active.name : active.display_name || active.username} src={active.avatar_url} large /><strong>{active.kind === 'group' ? active.name : `You and ${active.display_name || active.username}`}</strong><span>{active.kind === 'group' ? 'Your group conversation starts here.' : 'This is the beginning of your conversation.'}</span><span className="first-message-rule" /></div>}
             {messages.map((message, index) => {
@@ -1488,8 +1522,7 @@ function App() {
               const messageDelivered = message.is_delivered || messageSeen || (active.kind === 'group' && message.delivered_count > 0);
               const previous = messages[index - 1];
               const showAuthor = !previous || previous.sender_id !== message.sender_id;
-              return <div className={`message-row${mine ? ' message-mine' : ''}${showAuthor ? ' message-first' : ''}`} key={message.id}>
-                {!mine && showAuthor && <Avatar name={active.kind === 'group' ? message.sender_display_name || message.sender_username : active.display_name || active.username} src={active.kind === 'group' ? '' : active.avatar_url} />}
+              return <div className={`message-row${mine ? ' message-mine' : ''}${showAuthor ? ' message-first' : ''}`} data-message-id={message.id} key={message.id}>
                 <div className="message-stack">{active.kind === 'group' && showAuthor && !mine && <span className="group-message-author">{message.sender_display_name || message.sender_username}</span>}{message.body && <div className="message-bubble">{message.body}</div>}<span className="message-time">{relativeTime(message.created_at)}{mine && <span className={`message-read-receipt${messageSeen ? ' is-read' : messageDelivered ? ' is-delivered' : ''}`} title={active.kind === 'group' ? `${message.delivered_count || 0} delivered · ${message.read_count || 0} seen` : messageSeen ? 'Seen' : messageDelivered ? 'Delivered' : 'Sent'}>{active.kind === 'group' && message.read_count > 0 && <small>{message.read_count}/{message.recipient_count}</small>}{messageSeen || messageDelivered ? <CheckCheck size={14} /> : <Check size={13} />}</span>}</span></div>
               </div>;
             })}
