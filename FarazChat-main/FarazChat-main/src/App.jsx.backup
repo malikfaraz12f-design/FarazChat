@@ -240,7 +240,7 @@ function ContactProfileModal({ person, online, savedName, isBlocked, onClose, on
       <section className="contact-profile-modal" role="dialog" aria-modal="true" aria-label={`${person.profile_name || person.display_name || person.username} profile`}>
         <button className="icon-button contact-profile-close" onClick={onClose} aria-label="Close profile"><X size={19} /></button>
         <Avatar name={person.profile_name || person.display_name || person.username} src={person.avatar_url} large />
-        <h2>{person.profile_name || person.display_name || person.username}{person.isDeveloper && <ShieldCheck size={14} className="developer-badge" title="Developer" />}</h2>
+        <h2>{person.profile_name || person.display_name || person.username}</h2>
         <span className="contact-profile-username">#{person.contact_code || person.username}</span>
         <span className={`contact-profile-status${online ? ' contact-is-online' : ''}`}><i />{online ? 'Online' : 'Offline'}</span>
         <p>{person.bio || 'No bio yet.'}</p>
@@ -574,7 +574,7 @@ function NewChatModal({ onClose, onSelect }) {
           {!/^\d{8}$/.test(query.trim()) && <div className="search-empty"><span className="search-empty-icon"><UserRound size={21} /></span><strong>Find your people</strong><span>Enter the complete 8-digit contact code.</span></div>}
           {error && <p className="form-error search-error">{error}</p>}
           {/^\d{8}$/.test(query.trim()) && !error && users.length === 0 && <div className="search-empty"><span className="search-empty-icon"><Search size={20} /></span><strong>No account for that code</strong><span>Check all 8 digits and try again.</span></div>}
-          {users.map((person) => <button className="result-user" key={person.id} onClick={() => onSelect(person)}><Avatar name={person.display_name || person.username} src={person.avatar_url} /><span className="result-user-name"><strong>{person.display_name || person.username}{person.isDeveloper && <ShieldCheck size={14} className="developer-badge" title="Developer" />}</strong><span>#{person.contact_code || person.username}{person.bio ? ` · ${person.bio}` : ''}</span></span><span className="result-arrow">↗</span></button>)}
+          {users.map((person) => <button className="result-user" key={person.id} onClick={() => onSelect(person)}><Avatar name={person.display_name || person.username} src={person.avatar_url} /><span className="result-user-name"><strong>{person.display_name || person.username}</strong><span>#{person.contact_code || person.username}{person.bio ? ` · ${person.bio}` : ''}</span></span><span className="result-arrow">↗</span></button>)}
         </div>
       </section>
     </div>
@@ -644,7 +644,7 @@ function GroupModal({ user, onClose, onCreate }) {
           <div className="group-selected"><strong>{selected.size} selected</strong>{[...selected.values()].map((person) => <button key={person.id} type="button" onClick={() => toggleMember(person)}>{person.display_name || person.username}<X size={13} /></button>)}</div>
           <div className="group-user-results" aria-live="polite">
             {!/^\d{8}$/.test(query.trim()) && <span className="group-search-hint">Enter the complete 8-digit code to add someone.</span>}
-            {users.map((person) => <button type="button" key={person.id} className={`group-user-result${selected.has(person.id) ? ' is-selected' : ''}`} onClick={() => toggleMember(person)}><Avatar name={person.display_name || person.username} src={person.avatar_url} /><span><strong>{person.display_name || person.username}{person.isDeveloper && <ShieldCheck size={14} className="developer-badge" title="Developer" />}</strong><small>#{person.contact_code || person.username}</small></span><span className="member-check">{selected.has(person.id) ? '✓' : '+'}</span></button>)}
+            {users.map((person) => <button type="button" key={person.id} className={`group-user-result${selected.has(person.id) ? ' is-selected' : ''}`} onClick={() => toggleMember(person)}><Avatar name={person.display_name || person.username} src={person.avatar_url} /><span><strong>{person.display_name || person.username}</strong><small>#{person.contact_code || person.username}</small></span><span className="member-check">{selected.has(person.id) ? '✓' : '+'}</span></button>)}
           </div>
           {error && <p className="form-error" role="alert">{error}</p>}
           <button className="primary-button group-create-submit" disabled={busy || selected.size === 0}>{busy ? 'Creating…' : `Create group${selected.size ? ` · ${selected.size + 1} members` : ''}`}</button>

@@ -875,3 +875,4 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline-colo
   margin-left: 4px;
   vertical-align: middle;
   filter: drop-shadow(0 0 3px rgba(33, 150, 243, 0.6));
+}
