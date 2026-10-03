@@ -83,11 +83,14 @@ export function onAuthChange(callback) {
 
 export async function isCodeAvailable(contactCode) {
   try {
-    const usersQuery = query(collection(db, 'users'), where('contactCode', '==', contactCode));
+    const usersQuery = query(
+      collection(db, 'users'),
+      where('contactCode', '==', contactCode)
+    );
     const snapshot = await getDocs(usersQuery);
     return snapshot.empty;
   } catch (error) {
     console.error('Code check error:', error);
-    return false;
+    return true;  // ← error par "available" maano
   }
 }
