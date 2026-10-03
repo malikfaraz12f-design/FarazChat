@@ -12,33 +12,57 @@ export function directConversationId(firstId, secondId) {
 
 function toMessage(snapshot) {
   const data = snapshot.data();
-  const createdAt = data.createdAt?.toDate?.() || new Date();
+  const createdAt = data.createdAt?.toDate?.() || (data.created_at ? new Date(data.created_at) : new Date());
+  const senderId = data.senderId || data.sender_id;
   return {
     id: snapshot.id,
     ...data,
-    sender_id: data.senderId,
-    sender_username: data.senderContactCode || '',
-    sender_display_name: data.senderDisplayName || '',
-    group_id: data.groupId || null,
+    sender_id: senderId,
+    sender_username: data.senderContactCode || data.sender_username || '',
+    sender_display_name: data.senderDisplayName || data.sender_display_name || '',
+    group_id: data.groupId || data.group_id || null,
     created_at: createdAt.toISOString(),
     is_read: false,
     is_delivered: false,
   };
 }
 
+function matchesDirectChat(data, currentUserId, chatId) {
+  const senderId = data.senderId || data.sender_id;
+  const recipientId = data.recipientId || data.recipient_id;
+  const conversationId = data.conversationId || data.conversation_id || directConversationId(currentUserId, chatId);
+  return !data.groupId && !data.group_id && (
+    (senderId === currentUserId && recipientId === chatId) ||
+    (senderId === chatId && recipientId === currentUserId) ||
+    conversationId === directConversationId(currentUserId, chatId)
+  );
+}
+
 export function subscribeToMessages(chat, currentUser, onMessages, onError) {
   try {
-    const messagesQuery = chat.kind === 'group'
-      ? query(collection(db, 'messages'), where('groupId', '==', chat.id))
-      : query(collection(db, 'messages'), where('conversationId', '==', directConversationId(currentUser.id, chat.id)));
-    return onSnapshot(messagesQuery, (snapshot) => {
-      const messages = snapshot.docs.map(toMessage)
+    const reportError = (error) => {
+      console.error('Message subscription error:', error.code, error);
+      onError?.(new Error(`${error.code || 'firestore/error'}: ${error.message || 'Could not load messages.'}`));
+    };
+    if (chat.kind === 'group') {
+      const groupQuery = query(collection(db, 'messages'), where('groupId', '==', chat.id));
+      return onSnapshot(groupQuery, (snapshot) => {
+        onMessages(snapshot.docs.map(toMessage)
+          .sort((left, right) => new Date(left.created_at) - new Date(right.created_at)));
+      }, reportError);
+    }
+
+    const directMessagesQuery = query(
+      collection(db, 'messages'),
+      where('participants', 'array-contains', currentUser.id),
+    );
+    return onSnapshot(directMessagesQuery, (snapshot) => {
+      const matches = snapshot.docs
+        .filter((item) => matchesDirectChat(item.data(), currentUser.id, chat.id))
+        .map(toMessage)
         .sort((left, right) => new Date(left.created_at) - new Date(right.created_at));
-      onMessages(messages);
-    }, (error) => {
-      console.error('Message subscription error:', error);
-      onError?.(new Error(error.message || 'Could not load messages.'));
-    });
+      onMessages(matches);
+    }, reportError);
   } catch (error) {
     console.error('Message subscription setup error:', error);
     onError?.(new Error(error.message || 'Could not load messages.'));

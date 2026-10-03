@@ -21,7 +21,13 @@ The Firebase web configuration is in `src/firebase.js`. Use the configuration fo
 - `contacts/{ownerId_contactId}` stores a private nickname with `ownerId` and `contactId`.
 - `statuses/{statusId}` stores text, `ownerId`, and an `expiresAt` timestamp 24 hours after publication. Expired statuses are hidden by the app and the current user's expired documents are cleaned up when the status view is opened. For background deletion, enable a Firestore TTL policy on `statuses.expiresAt` in Google Cloud; client cleanup alone cannot run while the app is closed.
 
-Firestore Security Rules must permit authenticated users to read discoverable user profiles, read/write their own profile and contacts, read messages where they are a participant, read/write groups where they are a member, and read active statuses while restricting status creation/deletion to the owner. Rules are managed in the Firebase project and are not included in this repository, so verify they cover these collections before deployment.
+Firestore rules and indexes are in `firestore.rules` and `firestore.indexes.json`, configured for project `farazchat-2fdea`. Deploy them after signing in to Firebase CLI with:
+
+```sh
+npx firebase-tools deploy --only firestore:rules,firestore:indexes
+```
+
+The status rule permits deletion only by the status owner; without it, status deletion and expired-status cleanup fail with `Missing or insufficient permissions`. Message listeners use only single-field filters and do not need composite indexes. The user search uses a composite index for `contactCode` plus `discoverable`.
 
 Online presence is based on `lastSeen` within the previous five minutes. Typing indicators and delivery/read receipts are not currently provided.
 
