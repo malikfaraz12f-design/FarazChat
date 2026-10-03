@@ -1,7 +1,7 @@
 import { searchUserByCode, getMyProfile, updateUserProfile } from './lib/users';
 import { registerUser, loginUser, logoutUser, changeUserPassword, onAuthChange, isCodeAvailable } from './lib/auth';
 import { subscribeToConversations } from './lib/conversations';
-import { sendTextMessage, subscribeToMessages } from './lib/messages';
+import { markMessagesAsRead, sendTextMessage, subscribeToMessages } from './lib/messages';
 import { createGroup, getGroupMembers, subscribeToGroups } from './lib/groups';
 import { saveContact as saveFirestoreContact, subscribeToContacts } from './lib/contacts';
 import {
@@ -1141,6 +1141,12 @@ function App() {
     if (!active || !user) { setMessages([]); return undefined; }
     return subscribeToMessages(active, user, setMessages, (loadError) => setError(loadError.message));
   }, [active, user?.id]);
+
+  useEffect(() => {
+    if (!active || active.kind === 'group' || !user || messages.length === 0) return;
+    markMessagesAsRead(messages, user.id, active.id)
+      .catch((loadError) => setError(loadError.message));
+  }, [active?.id, active?.kind, messages, user?.id]);
 
   useEffect(() => {
     messageEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });

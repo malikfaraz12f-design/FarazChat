@@ -1,4 +1,4 @@
-import { addDoc, collection, doc, onSnapshot, query, serverTimestamp, updateDoc, where } from 'firebase/firestore';
+import { addDoc, collection, doc, onSnapshot, query, serverTimestamp, updateDoc, where, writeBatch } from 'firebase/firestore';
 import { db } from '../firebase';
 
 export function directConversationId(firstId, secondId) {
@@ -22,7 +22,8 @@ function toMessage(snapshot) {
     sender_display_name: data.senderDisplayName || data.sender_display_name || '',
     group_id: data.groupId || data.group_id || null,
     created_at: createdAt.toISOString(),
-    is_read: false,
+    read: Boolean(data.read),
+    is_read: Boolean(data.read),
     is_delivered: false,
   };
 }
@@ -70,6 +71,30 @@ export function subscribeToMessages(chat, currentUser, onMessages, onError) {
   }
 }
 
+export async function markMessagesAsRead(messages, currentUserId, chatId) {
+  try {
+    const unreadMessages = messages.filter((message) => {
+      const senderId = message.senderId || message.sender_id;
+      const recipientId = message.recipientId || message.recipient_id;
+      return message.read !== true
+        && senderId !== currentUserId
+        && recipientId === currentUserId
+        && senderId === chatId;
+    });
+
+    for (let offset = 0; offset < unreadMessages.length; offset += 450) {
+      const batch = writeBatch(db);
+      unreadMessages.slice(offset, offset + 450).forEach((message) => {
+        batch.update(doc(db, 'messages', message.id), { read: true });
+      });
+      await batch.commit();
+    }
+  } catch (error) {
+    console.error('Message read receipt error:', error);
+    throw new Error(error.message || 'Could not mark messages as read.');
+  }
+}
+
 export async function sendTextMessage({ chat, sender, body }) {
   try {
     const text = body.trim();
@@ -79,6 +104,7 @@ export async function sendTextMessage({ chat, sender, body }) {
       senderDisplayName: sender.displayName || sender.display_name || '',
       senderContactCode: sender.contactCode || sender.contact_code || '',
       body: text,
+      read: false,
       createdAt: serverTimestamp(),
     };
     if (chat.kind === 'group') {

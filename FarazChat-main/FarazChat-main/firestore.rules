@@ -35,6 +35,15 @@ service cloud.firestore {
             && request.resource.data.recipientId is string
             && request.resource.data.recipientId in request.resource.data.participants)
         );
+      allow update: if signedIn()
+        && 'recipientId' in resource.data
+        && resource.data.recipientId == request.auth.uid
+        && resource.data.senderId != request.auth.uid
+        && resource.data.participants is list
+        && request.auth.uid in resource.data.participants
+        && (!('read' in resource.data) || resource.data.read == false)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read'])
+        && request.resource.data.read == true;
     }
 
     match /groups/{groupId} {
