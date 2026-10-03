@@ -1,26 +1,29 @@
-import { searchUserByCode } from './lib/users';
-import { registerUser, loginUser, logoutUser, onAuthChange, isCodeAvailable } from './lib/auth';
+import { searchUserByCode, getMyProfile, updateUserProfile } from './lib/users';
+import { registerUser, loginUser, logoutUser, changeUserPassword, onAuthChange, isCodeAvailable } from './lib/auth';
+import { subscribeToConversations } from './lib/conversations';
+import { sendTextMessage, subscribeToMessages } from './lib/messages';
+import { createGroup, getGroupMembers, subscribeToGroups } from './lib/groups';
+import { saveContact as saveFirestoreContact, subscribeToContacts } from './lib/contacts';
+import {
+  addStatusComment,
+  deleteStatus as deleteFirestoreStatus,
+  getStatusInteractions,
+  markStatusViewed,
+  publishStatus as publishFirestoreStatus,
+  removeStatusComment,
+  subscribeToStatuses,
+  toggleStatusLike,
+} from './lib/statuses';
+import { subscribeToOnlineUsers, updateLastSeen } from './lib/presence';
 import { useEffect, useRef, useState } from 'react';
-import { Capacitor } from '@capacitor/core';
-import { io } from 'socket.io-client';
 import {
   ArrowLeft, Bell, Camera, Check, CheckCheck, Download, Eye, FileText, Heart, ImagePlus, KeyRound, LockKeyhole,
   LogOut, MessageCircle, Mic, Moon, Paperclip, Pause, Play, Plus, Search, Send, Settings, Shield, ShieldCheck,
   Smile, UserRound, UsersRound, X,
 } from 'lucide-react';
 
-const TOKEN_KEY = 'farazchat-token';
-const API_BASE_URL_KEY = 'farazchat-api-base-url';
 const CHAT_WALLPAPER_KEY = 'farazchat-chat-wallpaper';
 const APP_THEME_KEY = 'farazchat-app-theme';
-
-const currentOrigin = typeof window !== 'undefined' && window.location && window.location.origin ? window.location.origin : '';
-const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || localStorage.getItem(API_BASE_URL_KEY) || currentOrigin || '').replace(/\/+$/, '');
-
-function apiUrl(path) {
-  if (/^(https?:|blob:|data:)/.test(path)) return path;
-  return apiBaseUrl ? `${apiBaseUrl}${path.startsWith('/') ? '' : '/'}${path}` : path;
-}
 
 function compressWallpaper(file) {
   return new Promise((resolve, reject) => {
@@ -49,40 +52,37 @@ function compressWallpaper(file) {
   });
 }
 
-async function api(path, token, options = {}) {
-  const isFormData = options.body instanceof FormData;
-  let response;
-  try {
-    response = await fetch(apiUrl(path), {
-      ...options,
-      headers: {
-        ...(options.body && !isFormData ? { 'Content-Type': 'application/json' } : {}),
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        ...options.headers,
-      },
-    });
-  } catch {
-    throw new Error('Cannot reach the FarazChat server. Check the server address and your internet connection.');
-  }
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(result.error || 'Something went wrong. Try again.');
-  return result;
-}
-
-async function uploadAvatar(token, file) {
-  const response = await fetch(apiUrl('/api/me/avatar'), {
-    method: 'PATCH',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': file.type },
-    body: file,
+function compressImage(file) {
+  return new Promise((resolve, reject) => {
+    const sourceUrl = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(sourceUrl);
+      try {
+        const scale = Math.min(1, 400 / Math.max(image.naturalWidth, image.naturalHeight));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+        canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+        const context = canvas.getContext('2d');
+        if (!context) throw new Error('Could not process that image.');
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL('image/jpeg', 0.7).split(',')[1]);
+      } catch (error) {
+        reject(error);
+      }
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(sourceUrl);
+      reject(new Error('Could not open that image.'));
+    };
+    image.src = sourceUrl;
   });
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(result.error || 'Could not upload your photo.');
-  return result.user;
 }
 
 function relativeTime(date) {
   if (!date) return '';
-  const parsed = new Date(`${date.replace(' ', 'T')}Z`);
+  const parsed = date?.toDate ? date.toDate() : new Date(date);
+  if (Number.isNaN(parsed.getTime())) return '';
   const now = new Date();
   if (parsed.toDateString() === now.toDateString()) {
     return parsed.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
@@ -93,7 +93,7 @@ function relativeTime(date) {
 function Avatar({ name = '?', src = '', large = false }) {
   const [imageFailed, setImageFailed] = useState(false);
   useEffect(() => { setImageFailed(false); }, [src]);
-  const imageUrl = src ? apiUrl(src) : '';
+  const imageUrl = src && !/^(https?:|blob:|data:)/.test(src) ? `data:image/jpeg;base64,${src}` : src;
   return <div className={`avatar${large ? ' avatar-large' : ''}`} aria-hidden="true">{imageUrl && !imageFailed ? <img src={imageUrl} alt="" onError={() => setImageFailed(true)} /> : name.slice(0, 1).toUpperCase()}</div>;
 }
 
@@ -187,46 +187,11 @@ function VoiceNotePlayer({ src, waveform = [] }) {
   );
 }
 
-function AttachmentCard({ attachment, token }) {
-  const [url, setUrl] = useState('');
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    let objectUrl = '';
-    fetch(apiUrl(attachment.url), {
-      headers: { Authorization: `Bearer ${token}` },
-      signal: controller.signal,
-    }).then((response) => {
-      if (!response.ok) throw new Error('Attachment unavailable');
-      return response.blob();
-    }).then((blob) => {
-      objectUrl = URL.createObjectURL(blob);
-      setUrl(objectUrl);
-    }).catch((error) => {
-      if (error.name !== 'AbortError') setFailed(true);
-    });
-    return () => {
-      controller.abort();
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [attachment.url, token]);
-
-  if (failed) return <div className="attachment-unavailable">Attachment unavailable</div>;
-  if (!url) return <div className="attachment-loading"><FileText size={17} /> Loading {attachment.name}…</div>;
-  if (attachment.inline && attachment.type.startsWith('image/')) {
-    return <a className="message-attachment-image" href={url} target="_blank" rel="noreferrer"><img src={url} alt={attachment.name} loading="lazy" /></a>;
-  }
-  if (attachment.type.startsWith('audio/')) {
-    return <VoiceNotePlayer src={url} waveform={attachment.waveform} />;
-  }
-  if (attachment.type.startsWith('video/')) {
-    return <video className="message-attachment-media" controls preload="metadata" src={url}>{attachment.name}</video>;
-  }
-  return <a className="message-file" href={url} download={attachment.name}><span className="file-icon"><FileText size={18} /></span><span><strong>{attachment.name}</strong><small>{formatFileSize(attachment.size)}</small></span><Download size={16} /></a>;
+function AttachmentCard() {
+  return <div className="attachment-unavailable">Attachments are not supported yet.</div>;
 }
 
-function ContactProfileModal({ token, person, online, savedName, onClose, onSaveContact }) {
+function ContactProfileModal({ person, online, savedName, onClose, onSaveContact }) {
   const [nickname, setNickname] = useState(savedName || person.saved_as || person.display_name || person.username);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -266,7 +231,6 @@ function ContactProfileModal({ token, person, online, savedName, onClose, onSave
 }
 
 function AuthScreen({ onLogin }) {
-  const isNativePlatform = Capacitor.isNativePlatform();
   const [screen, setScreen] = useState('welcome');
   const [registerStep, setRegisterStep] = useState(1);
   const [displayName, setDisplayName] = useState('');
@@ -279,8 +243,6 @@ function AuthScreen({ onLogin }) {
   const [policiesAccepted, setPoliciesAccepted] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const [showServerSetup, setShowServerSetup] = useState(false);
-  const [serverAddress, setServerAddress] = useState(apiBaseUrl);
   const [codeAvailability, setCodeAvailability] = useState('');
   
   useEffect(() => {
@@ -353,21 +315,6 @@ function AuthScreen({ onLogin }) {
     setRegisterStep((step) => Math.min(step + 1, 4));
   }
 
-  function saveServerAddress(event) {
-    event.preventDefault();
-    setError('');
-    try {
-      const serverUrl = new URL(serverAddress.trim());
-      if (serverUrl.protocol !== 'https:' || serverUrl.username || serverUrl.password || serverUrl.search || serverUrl.hash) {
-        throw new Error('Invalid server URL');
-      }
-      localStorage.setItem(API_BASE_URL_KEY, serverUrl.toString().replace(/\/+$/, ''));
-      window.location.reload();
-    } catch {
-      setError('Enter a valid HTTPS address for your FarazChat server.');
-    }
-  }
-
   async function submit(event) {
     event.preventDefault();
     if (screen === 'register' && !policiesAccepted) return setError('Please accept the account policies to finish registration.');
@@ -384,7 +331,12 @@ function AuthScreen({ onLogin }) {
           displayName,
           bio,
         });
-        result = { user: newUser };
+        if (photoFile) {
+          const avatarBase64 = await compressImage(photoFile);
+          result = { user: await updateUserProfile(newUser.id, { avatarBase64 }) };
+        } else {
+          result = { user: await getMyProfile(newUser.id) };
+        }
       } else {
         const loggedInUser = await loginUser({
           contactCode,
@@ -432,32 +384,13 @@ function AuthScreen({ onLogin }) {
           <div className="auth-footnote"><ShieldCheck size={17} /><span>Accounts and messages stay on your FarazChat server.</span></div>
         </div>
         <div className="auth-form-wrap">
-          {screen === 'welcome' && showServerSetup && (
-            <div className="auth-choice-screen">
-              <span className="form-icon"><MessageCircle size={19} /></span>
-              <h2>Connect to your server</h2>
-              <p>Enter the HTTPS address where your FarazChat server is hosted.</p>
-              <form className="auth-form" onSubmit={saveServerAddress}>
-                <label htmlFor="server-address">Server address</label>
-                <div className="field-with-icon">
-                  <LockKeyhole size={17} />
-                  <input id="server-address" type="url" autoComplete="url" autoCapitalize="off" spellCheck="false" value={serverAddress} onChange={(event) => setServerAddress(event.target.value)} placeholder="https://chat.example.com" required />
-                </div>
-                {error && <p className="form-error" role="alert">{error}</p>}
-                <button className="primary-button auth-submit" type="submit">Connect <span>→</span></button>
-                <button type="button" className="secondary-button" onClick={() => { setShowServerSetup(false); setError(''); }}>Back</button>
-              </form>
-            </div>
-          )}
-
-          {screen === 'welcome' && !showServerSetup && (
+          {screen === 'welcome' && (
             <div className="auth-choice-screen">
               <span className="form-icon"><MessageCircle size={19} /></span>
               <h2>Welcome to FarazChat</h2>
               <p>Choose how you want to continue.</p>
               <button className="primary-button" onClick={() => setScreen('register')}>Create account <span>→</span></button>
               <button className="secondary-button" onClick={() => setScreen('login')}>Log in <span>→</span></button>
-              {isNativePlatform && <button className="ghost-button" type="button" style={{ marginTop: '8px', width: '100%' }} onClick={() => setShowServerSetup(true)}>Use custom server</button>}
             </div>
           )}
 
@@ -586,7 +519,7 @@ function AuthScreen({ onLogin }) {
     </main>
   );
 }
-function NewChatModal({ token, onClose, onSelect }) {
+function NewChatModal({ onClose, onSelect }) {
   const [query, setQuery] = useState('');
   const [users, setUsers] = useState([]);
   const [error, setError] = useState('');
@@ -602,14 +535,14 @@ function NewChatModal({ token, onClose, onSelect }) {
     }
     const timer = setTimeout(async () => {
       try {
-        const result = await api(`/api/users/search?q=${encodeURIComponent(query.trim())}`, token);
-        if (alive) { setUsers(result.users); setError(''); }
+        const person = await searchUserByCode(query.trim());
+        if (alive) { setUsers(person ? [person] : []); setError(''); }
       } catch (requestError) {
         if (alive) setError(requestError.message);
       }
     }, 180);
     return () => { alive = false; clearTimeout(timer); };
-  }, [query, token]);
+  }, [query]);
 
   return (
     <div className="modal-scrim" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
@@ -627,7 +560,7 @@ function NewChatModal({ token, onClose, onSelect }) {
   );
 }
 
-function GroupModal({ token, onClose, onCreate }) {
+function GroupModal({ user, onClose, onCreate }) {
   const [name, setName] = useState('');
   const [query, setQuery] = useState('');
   const [users, setUsers] = useState([]);
@@ -643,14 +576,14 @@ function GroupModal({ token, onClose, onCreate }) {
     }
     const timer = setTimeout(async () => {
       try {
-        const result = await api(`/api/users/search?q=${encodeURIComponent(query.trim())}`, token);
-        if (alive) { setUsers(result.users); setError(''); }
+        const person = await searchUserByCode(query.trim());
+        if (alive) { setUsers(person ? [person] : []); setError(''); }
       } catch (requestError) {
         if (alive) setError(requestError.message);
       }
     }, 180);
     return () => { alive = false; clearTimeout(timer); };
-  }, [query, token]);
+  }, [query]);
 
   function toggleMember(user) {
     setSelected((current) => {
@@ -666,11 +599,12 @@ function GroupModal({ token, onClose, onCreate }) {
     setError('');
     setBusy(true);
     try {
-      const result = await api('/api/groups', token, {
-        method: 'POST',
-        body: JSON.stringify({ name, memberIds: [...selected.keys()] }),
+      const group = await createGroup({
+        name,
+        memberIds: [...selected.keys()],
+        creator: user,
       });
-      onCreate(result.group);
+      onCreate(group);
     } catch (requestError) {
       setError(requestError.message);
     } finally {
@@ -699,34 +633,13 @@ function GroupModal({ token, onClose, onCreate }) {
   );
 }
 
-function StatusComposerModal({ token, onClose, onPublished }) {
+function StatusComposerModal({ user, onClose, onPublished }) {
   const [body, setBody] = useState('');
-  const [file, setFile] = useState(null);
-  const [preview, setPreview] = useState('');
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const textareaRef = useRef(null);
   const emojis = ['😀', '😂', '😍', '🥰', '😎', '🎉', '❤️', '🔥', '🙏', '✨', '👍', '😊'];
-
-  useEffect(() => {
-    if (!preview) return undefined;
-    return () => URL.revokeObjectURL(preview);
-  }, [preview]);
-
-  function chooseMedia(event) {
-    const selectedFile = event.target.files?.[0];
-    event.target.value = '';
-    if (!selectedFile) return;
-    if ((!selectedFile.type.startsWith('image/') && !selectedFile.type.startsWith('video/'))
-      || selectedFile.size > 15 * 1024 * 1024) {
-      setError('Choose an image or video under 15 MB.');
-      return;
-    }
-    setError('');
-    setFile(selectedFile);
-    setPreview(URL.createObjectURL(selectedFile));
-  }
 
   function insertEmoji(emoji) {
     const textarea = textareaRef.current;
@@ -744,17 +657,14 @@ function StatusComposerModal({ token, onClose, onPublished }) {
 
   async function submit(event) {
     event.preventDefault();
-    if (!body.trim() && !file) {
-      setError('Add some text or a photo/video first.');
+    if (!body.trim()) {
+      setError('Write something before sharing your status.');
       return;
     }
     setBusy(true);
     setError('');
-    const formData = new FormData();
-    formData.append('body', body.trim());
-    if (file) formData.append('file', file);
     try {
-      await api('/api/statuses', token, { method: 'POST', body: formData });
+      await publishFirestoreStatus(user, body);
       onPublished();
     } catch (requestError) {
       setError(requestError.message);
@@ -771,8 +681,7 @@ function StatusComposerModal({ token, onClose, onPublished }) {
           <div className="status-text-heading"><label htmlFor="status-text">Your update</label><button type="button" className="icon-button" onClick={() => setEmojiOpen((open) => !open)} aria-label="Add emoji" title="Add emoji"><Smile size={19} /></button></div>
           <textarea ref={textareaRef} id="status-text" value={body} onChange={(event) => setBody(event.target.value)} maxLength={700} placeholder="What’s happening?" aria-label="Status text" />
           {emojiOpen && <div className="status-emoji-picker" aria-label="Choose an emoji">{emojis.map((emoji) => <button key={emoji} type="button" onClick={() => insertEmoji(emoji)} aria-label={`Insert ${emoji}`}>{emoji}</button>)}</div>}
-          {preview && <div className="status-preview">{file?.type.startsWith('video/') ? <video src={preview} controls /> : <img src={preview} alt="Status preview" />}<button type="button" className="icon-button" onClick={() => { setFile(null); setPreview(''); }}>×</button></div>}
-          <div className="status-composer-actions"><label className="photo-pick-button"><Camera size={15} /> Add photo/video<input type="file" accept="image/*,video/*" onChange={chooseMedia} /></label><span>{body.length}/700</span><button className="primary-button" disabled={busy}>{busy ? 'Sharing…' : 'Share status'}</button></div>
+          <div className="status-composer-actions"><span>{body.length}/700</span><button className="primary-button" disabled={busy}>{busy ? 'Sharing…' : 'Share status'}</button></div>
           {error && <p className="form-error" role="alert">{error}</p>}
         </form>
       </section>
@@ -780,7 +689,7 @@ function StatusComposerModal({ token, onClose, onPublished }) {
   );
 }
 
-function StatusViewerModal({ token, update, onClose, onDelete, onOpenChat, initialStatusId }) {
+function StatusViewerModal({ user, update, onClose, onDelete, onOpenChat, initialStatusId }) {
   const [index, setIndex] = useState(() => Math.max(0, update.statuses.findIndex((item) => item.id === initialStatusId)));
   const [error, setError] = useState('');
   const [interactions, setInteractions] = useState(null);
@@ -798,26 +707,23 @@ function StatusViewerModal({ token, update, onClose, onDelete, onOpenChat, initi
     setError('');
     (async () => {
       try {
-        if (!update.own) await api(`/api/statuses/${status.id}/view`, token, { method: 'POST' });
-        const result = await api(`/api/statuses/${status.id}/interactions`, token);
+        if (!update.own) await markStatusViewed(status.id, user.id);
+        const result = await getStatusInteractions(status.id, user.id);
         if (active) setInteractions(result);
       } catch (requestError) {
         if (active) setError(requestError.message);
       }
     })();
     return () => { active = false; };
-  }, [status?.id, token, update.own]);
+  }, [status?.id, user.id, update.own]);
 
   async function toggleLike() {
     if (!interactions) return;
     setSavingInteraction(true);
     setError('');
     try {
-      const result = await api(`/api/statuses/${status.id}/like`, token, {
-        method: 'PUT',
-        body: JSON.stringify({ liked: !interactions.liked }),
-      });
-      setInteractions((current) => ({ ...current, ...result }));
+      const result = await toggleStatusLike(status.id, user.id, interactions.liked);
+      setInteractions(result);
     } catch (requestError) {
       setError(requestError.message);
     } finally {
@@ -832,11 +738,8 @@ function StatusViewerModal({ token, update, onClose, onDelete, onOpenChat, initi
     setSavingInteraction(true);
     setError('');
     try {
-      const result = await api(`/api/statuses/${status.id}/comments`, token, {
-        method: 'POST',
-        body: JSON.stringify({ body }),
-      });
-      setInteractions((current) => ({ ...current, comments: [...current.comments, result.comment] }));
+      const comment = await addStatusComment(status.id, user, body);
+      setInteractions((current) => ({ ...current, comments: [...current.comments, comment] }));
       setCommentDraft('');
     } catch (requestError) {
       setError(requestError.message);
@@ -845,18 +748,18 @@ function StatusViewerModal({ token, update, onClose, onDelete, onOpenChat, initi
     }
   }
 
-  async function deleteComment(commentId) {
+  async function deleteComment(comment) {
     try {
-      await api(`/api/statuses/${status.id}/comments/${commentId}`, token, { method: 'DELETE' });
-      setInteractions((current) => ({ ...current, comments: current.comments.filter((comment) => comment.id !== commentId) }));
+      await removeStatusComment(status.id, comment);
+      setInteractions((current) => ({ ...current, comments: current.comments.filter((item) => item.id !== comment.id) }));
     } catch (requestError) {
       setError(requestError.message);
     }
   }
 
-  async function deleteStatus() {
+  async function deleteCurrentStatus() {
     try {
-      await api(`/api/statuses/${status.id}`, token, { method: 'DELETE' });
+      await deleteFirestoreStatus(status.id);
       onDelete(status.id);
     } catch (requestError) {
       setError(requestError.message);
@@ -868,14 +771,14 @@ function StatusViewerModal({ token, update, onClose, onDelete, onOpenChat, initi
       <section className="status-viewer" role="dialog" aria-modal="true" aria-label={`${update.user.display_name}'s status`}>
         <header><Avatar name={update.user.display_name || update.user.username} src={update.user.avatar_url} /><span><strong>{update.own ? 'My status' : update.user.display_name || update.user.username}</strong><small>{new Date(status.created_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</small></span><button className="icon-button" onClick={onClose} aria-label="Close status"><X size={19} /></button></header>
         <div className="status-progress"><i style={{ width: `${((index + 1) / update.statuses.length) * 100}%` }} /></div>
-        <main>{status.attachment && <AttachmentCard attachment={status.attachment} token={token} />}{status.body && <p>{status.body}</p>}</main>
+        <main>{status.body && <p>{status.body}</p>}</main>
         <section className="status-interactions" aria-label="Status interactions">
           <div className="status-reaction-row"><button className={`status-like-button${interactions?.liked ? ' is-liked' : ''}`} onClick={toggleLike} disabled={!interactions || savingInteraction} aria-pressed={Boolean(interactions?.liked)}><Heart size={17} fill={interactions?.liked ? 'currentColor' : 'none'} />{interactions?.likes_count ?? status.likes_count ?? 0}</button><span className="status-view-count"><Eye size={16} />{interactions?.views_count ?? status.views_count ?? 0} views</span></div>
           {update.own && interactions?.viewers.length > 0 && <div className="status-viewer-list"><strong>Seen by</strong>{interactions.viewers.map((viewer) => <span key={viewer.id}><Avatar name={viewer.display_name || viewer.username} src={viewer.avatar_url} />{viewer.display_name || viewer.username}</span>)}</div>}
-          <div className="status-comments"><strong>Comments {interactions ? `· ${interactions.comments.length}` : ''}</strong>{interactions?.comments.map((comment) => <div className="status-comment" key={comment.id}><button className="status-comment-avatar" type="button" onClick={() => onOpenChat(comment.user)} aria-label={`Open chat with ${comment.user.display_name || comment.user.username}`} title="Open personal chat"><Avatar name={comment.user.display_name || comment.user.username} src={comment.user.avatar_url} /></button><span><b>{comment.user.display_name || comment.user.username}</b><span>{comment.body}</span></span>{(comment.user.id === Number(update.user.id) || update.own) && <button className="status-comment-delete" onClick={() => deleteComment(comment.id)} aria-label="Delete comment"><X size={14} /></button>}</div>)}</div>
+          <div className="status-comments"><strong>Comments {interactions ? `· ${interactions.comments.length}` : ''}</strong>{interactions?.comments.map((comment) => <div className="status-comment" key={comment.id}><button className="status-comment-avatar" type="button" onClick={() => onOpenChat(comment.user)} aria-label={`Open chat with ${comment.user.display_name || comment.user.username}`} title="Open personal chat"><Avatar name={comment.user.display_name || comment.user.username} src={comment.user.avatar_url} /></button><span><b>{comment.user.display_name || comment.user.username}</b><span>{comment.body}</span></span>{(comment.user.id === update.user.id || update.own) && <button className="status-comment-delete" onClick={() => deleteComment(comment)} aria-label="Delete comment"><X size={14} /></button>}</div>)}</div>
           <form className="status-comment-form" onSubmit={submitComment}><input value={commentDraft} onChange={(event) => setCommentDraft(event.target.value)} placeholder="Reply to status…" maxLength={500} aria-label="Comment on status" disabled={!interactions || savingInteraction} /><button type="submit" disabled={!commentDraft.trim() || !interactions || savingInteraction} aria-label="Send comment"><Send size={16} /></button></form>
         </section>
-        <footer>{canGoBack && <button onClick={() => setIndex(index - 1)}>Newer</button>}<span>{index + 1} / {update.statuses.length}</span>{canGoForward && <button onClick={() => setIndex(index + 1)}>Older</button>}{update.own && <button className="status-delete" onClick={deleteStatus}>Delete</button>}</footer>
+        <footer>{canGoBack && <button onClick={() => setIndex(index - 1)}>Newer</button>}<span>{index + 1} / {update.statuses.length}</span>{canGoForward && <button onClick={() => setIndex(index + 1)}>Older</button>}{update.own && <button className="status-delete" onClick={deleteCurrentStatus}>Delete</button>}</footer>
         {error && <p className="form-error">{error}</p>}
       </section>
     </div>
@@ -901,16 +804,16 @@ function StatusActivityModal({ notifications, onClose, onOpenStatus }) {
   );
 }
 
-function GroupDetailsModal({ token, group, onClose }) {
+function GroupDetailsModal({ group, onClose }) {
   const [members, setMembers] = useState([]);
   const [error, setError] = useState('');
   useEffect(() => {
     let alive = true;
-    api(`/api/groups/${group.id}`, token).then((result) => {
-      if (alive) setMembers(result.members);
+    getGroupMembers(group).then((result) => {
+      if (alive) setMembers(result);
     }).catch((requestError) => { if (alive) setError(requestError.message); });
     return () => { alive = false; };
-  }, [group.id, token]);
+  }, [group]);
 
   return (
     <div className="modal-scrim" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
@@ -924,7 +827,7 @@ function GroupDetailsModal({ token, group, onClose }) {
   );
 }
 
-function SettingsModal({ token, user, initialSection, chatWallpaper, onWallpaperChange, theme, onThemeChange, onClose, onSave, onSignOut }) {
+function SettingsModal({ user, initialSection, chatWallpaper, onWallpaperChange, theme, onThemeChange, onClose, onSave, onSignOut }) {
   const [section, setSection] = useState(initialSection);
   const [displayName, setDisplayName] = useState(user.display_name || user.username);
   const [bio, setBio] = useState(user.bio || '');
@@ -978,16 +881,13 @@ function SettingsModal({ token, user, initialSection, chatWallpaper, onWallpaper
     setNotice('');
     setBusy(true);
     try {
-      const result = await api('/api/me', token, {
-        method: 'PATCH',
-        body: JSON.stringify({
-          displayName: includeProfile ? displayName : user.display_name || user.username,
-          bio: includeProfile ? bio : user.bio || '',
-          notificationsEnabled: changes.notificationsEnabled ?? notificationsEnabled,
-          discoverable: changes.discoverable ?? discoverable,
-        }),
+      const profile = await updateUserProfile(user.id, {
+        displayName: includeProfile ? displayName : user.displayName || user.display_name || user.username,
+        bio: includeProfile ? bio : user.bio || '',
+        notificationsEnabled: changes.notificationsEnabled ?? notificationsEnabled,
+        discoverable: changes.discoverable ?? discoverable,
       });
-      onSave(result.user);
+      onSave(profile);
       setNotice('Settings saved.');
       return true;
     } catch (requestError) {
@@ -1067,7 +967,8 @@ function SettingsModal({ token, user, initialSection, chatWallpaper, onWallpaper
     setNotice('');
     setBusy(true);
     try {
-      const profile = await uploadAvatar(token, file);
+      const avatarBase64 = await compressImage(file);
+      const profile = await updateUserProfile(user.id, { avatarBase64 });
       setPhotoPreview(profile.avatar_url);
       onSave(profile);
       setNotice('Profile photo updated.');
@@ -1084,10 +985,7 @@ function SettingsModal({ token, user, initialSection, chatWallpaper, onWallpaper
     setNotice('');
     setBusy(true);
     try {
-      await api('/api/me/password', token, {
-        method: 'PATCH',
-        body: JSON.stringify({ currentPassword, newPassword }),
-      });
+      await changeUserPassword(currentPassword, newPassword);
       setCurrentPassword('');
       setNewPassword('');
       setNotice('Password changed.');
@@ -1134,9 +1032,8 @@ function SettingsModal({ token, user, initialSection, chatWallpaper, onWallpaper
 }
 
 function App() {
-  const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY));
   const [user, setUser] = useState(null);
-  const [loading, setLoading] = useState(Boolean(localStorage.getItem(TOKEN_KEY)));
+  const [loading, setLoading] = useState(true);
   const [conversations, setConversations] = useState([]);
   const [contacts, setContacts] = useState([]);
   const [groups, setGroups] = useState([]);
@@ -1153,17 +1050,17 @@ function App() {
   const [statusComposerOpen, setStatusComposerOpen] = useState(false);
   const [activeStatus, setActiveStatus] = useState(null);
   const [activeStatusId, setActiveStatusId] = useState(null);
-  const [statusNotifications, setStatusNotifications] = useState([]);
   const [activityOpen, setActivityOpen] = useState(false);
   const [groupDetailsOpen, setGroupDetailsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState('profile');
   const [contactProfileOpen, setContactProfileOpen] = useState(false);
   const [mobileChat, setMobileChat] = useState(false);
-  const [socketReady, setSocketReady] = useState(false);
   const [onlineUsers, setOnlineUsers] = useState(() => new Set());
-  const [contactTyping, setContactTyping] = useState(false);
-  const [typingName, setTypingName] = useState('');
+  const statusNotifications = [];
+  const socketReady = Boolean(user);
+  const contactTyping = false;
+  const typingName = '';
   const [selectedFile, setSelectedFile] = useState(null);
   const [selectedWaveform, setSelectedWaveform] = useState([]);
   const [isRecording, setIsRecording] = useState(false);
@@ -1174,10 +1071,6 @@ function App() {
   const [sendingMessage, setSendingMessage] = useState(false);
   const [error, setError] = useState('');
   const messageEndRef = useRef(null);
-  const socketRef = useRef(null);
-  const activeRef = useRef(active);
-  const mobileChatRef = useRef(mobileChat);
-  const typingTimerRef = useRef(null);
   const photoInputRef = useRef(null);
   const fileInputRef = useRef(null);
   const recorderRef = useRef(null);
@@ -1192,246 +1085,62 @@ function App() {
   const sendVoiceOnStopRef = useRef(false);
   const recordingPointerRef = useRef(null);
 
-  useEffect(() => { activeRef.current = active; }, [active]);
-  useEffect(() => { mobileChatRef.current = mobileChat; }, [mobileChat]);
-
   useEffect(() => {
-    function syncAccount(event) {
+    function syncPreferences(event) {
       if (event.key === APP_THEME_KEY) {
         setTheme(event.newValue === 'dark' ? 'dark' : 'light');
-        return;
-      }
-      if (event.key === CHAT_WALLPAPER_KEY) {
+      } else if (event.key === CHAT_WALLPAPER_KEY) {
         setChatWallpaper(event.newValue || 'paper');
+      }
+    }
+    window.addEventListener('storage', syncPreferences);
+    return () => window.removeEventListener('storage', syncPreferences);
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    const unsubscribe = onAuthChange((firebaseUser) => {
+      setLoading(true);
+      if (!firebaseUser) {
+        setUser(null);
+        setLoading(false);
         return;
       }
-      if (event.key !== TOKEN_KEY && event.key !== null) return;
-      if (event.key === null) {
-        setChatWallpaper('paper');
-        setTheme('light');
-      }
-      const nextToken = event.key === null ? null : event.newValue;
-      if (nextToken === token) return;
-      socketRef.current?.disconnect();
-      setLoading(Boolean(nextToken));
-      setToken(nextToken);
-      setUser(null);
-      setActive(null);
-      setMessages([]);
-      setConversations([]);
-      setContacts([]);
-      setGroups([]);
-      setStatusUpdates([]);
-      setStatusNotifications([]);
-      setActiveStatus(null);
-      setActiveStatusId(null);
-      setActivityOpen(false);
-      setSettingsOpen(false);
-      setError('');
-    }
-    window.addEventListener('storage', syncAccount);
-    return () => window.removeEventListener('storage', syncAccount);
-  }, [token]);
+      getMyProfile(firebaseUser.uid)
+        .then((profile) => { if (alive) setUser(profile); })
+        .catch((loadError) => { if (alive) { setUser(null); setError(loadError.message); } })
+        .finally(() => { if (alive) setLoading(false); });
+    });
+    return () => { alive = false; unsubscribe(); };
+  }, []);
 
   useEffect(() => {
-    if (!isRecording) { setRecordingSeconds(0); return undefined; }
-    const timer = setInterval(() => setRecordingSeconds((seconds) => seconds + 1), 1000);
-    return () => clearInterval(timer);
-  }, [isRecording]);
-
-  useEffect(() => {
-    if (!token) { setLoading(false); return; }
-    let alive = true;
-    api('/api/me', token).then((result) => {
-      if (alive) setUser(result.user);
-    }).catch(() => {
-      localStorage.removeItem(TOKEN_KEY);
-      if (alive) { setToken(null); setUser(null); }
-    }).finally(() => { if (alive) setLoading(false); });
-    return () => { alive = false; };
-  }, [token]);
-
-  async function loadConversations() {
-    if (!token) return;
-    const [directResult, groupResult, contactResult] = await Promise.all([
-      api('/api/conversations', token),
-      api('/api/groups', token),
-      api('/api/contacts', token),
-    ]);
-    setConversations(directResult.conversations);
-    setGroups(groupResult.groups);
-    setContacts(contactResult.contacts);
-  }
-
-  async function loadStatuses() {
-    if (!token) return [];
-    const result = await api('/api/statuses', token);
-    setStatusUpdates(result.updates);
-    return result.updates;
-  }
-
-  async function loadStatusNotifications() {
-    if (!token) return null;
-    const result = await api('/api/status-notifications', token);
-    setStatusNotifications((current) => {
-      const merged = new Map(current.map((notification) => [notification.id, notification]));
-      result.notifications.forEach((notification) => {
-        const currentNotification = merged.get(notification.id);
-        merged.set(notification.id, currentNotification?.read_at ? currentNotification : notification);
-      });
-      return [...merged.values()].sort((left, right) => right.id - left.id).slice(0, 100);
-    });
-    return result;
-  }
-
-  async function openStatusActivity() {
-    setActivityOpen(true);
-    try {
-      const result = await loadStatusNotifications();
-      if (result?.unread_count) {
-        await api('/api/status-notifications/read', token, { method: 'POST', body: JSON.stringify({}) });
-        const readAt = Date.now();
-        setStatusNotifications((current) => current.map((notification) => ({ ...notification, read_at: notification.read_at || readAt })));
-      }
-    } catch (loadError) {
-      setError(loadError.message);
-    }
-  }
-
-  async function openNotifiedStatus(statusId) {
-    try {
-      const updates = statusUpdates.some((update) => update.own && update.statuses.some((status) => status.id === statusId))
-        ? statusUpdates
-        : await loadStatuses();
-      const ownStatus = updates.find((update) => update.own && update.statuses.some((status) => status.id === statusId));
-      if (!ownStatus) throw new Error('That status has expired.');
-      setActivityOpen(false);
-      setActiveStatus(ownStatus);
-      setActiveStatusId(statusId);
-    } catch (openError) {
-      setError(openError.message);
-    }
-  }
-
-  useEffect(() => {
-    if (!token || !user) return;
-    let alive = true;
-    loadConversations().catch((loadError) => { if (alive) setError(loadError.message); });
-    loadStatusNotifications().catch((loadError) => { if (alive) setError(loadError.message); });
-    const socket = io(apiBaseUrl || undefined, { auth: { token } });
-    socketRef.current = socket;
-    socket.on('connect', () => {
-      setSocketReady(true);
-      loadStatusNotifications().catch(() => {});
-    });
-    socket.on('disconnect', () => setSocketReady(false));
-    socket.on('presence:sync', (userIds) => setOnlineUsers(new Set(userIds)));
-    socket.on('presence:update', ({ userId, online }) => {
-      setOnlineUsers((current) => {
-        const next = new Set(current);
-        if (online) next.add(userId);
-        else next.delete(userId);
-        return next;
-      });
-    });
-    socket.on('typing', (typingEvent) => {
-      const { userId, isTyping, groupId, username } = typingEvent;
-      const selected = activeRef.current;
-      const matches = selected?.kind === 'group'
-        ? selected.id === groupId
-        : selected?.id === userId;
-      if (!matches) return;
-      setContactTyping(isTyping);
-      setTypingName(isTyping ? (username || '') : '');
-      clearTimeout(typingTimerRef.current);
-      if (isTyping) typingTimerRef.current = setTimeout(() => {
-        setContactTyping(false);
-        setTypingName('');
-      }, 2200);
-    });
-    socket.on('message', (message) => {
-      const selected = activeRef.current;
-      const matches = selected?.kind === 'group'
-        ? message.group_id === selected.id
-        : !message.group_id && selected?.id === (message.sender_id === user.id ? message.recipient_id : message.sender_id);
-      if (matches) {
-        setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
-        const chatIsVisible = !document.hidden && (window.innerWidth > 760 || mobileChatRef.current);
-        if (chatIsVisible && message.sender_id !== user.id) {
-          const readBody = selected.kind === 'group'
-            ? { groupId: selected.id }
-            : { otherUserId: selected.id };
-          api('/api/messages/read', token, { method: 'POST', body: JSON.stringify(readBody) }).catch(() => {});
-        }
-      }
-      if (message.sender_id !== user.id && user.notifications_enabled
-        && (document.hidden || activeRef.current?.id !== message.sender_id)
-        && 'Notification' in window && Notification.permission === 'granted') {
-        new Notification(message.sender_username || 'New message', {
-          body: message.body,
-          tag: `farazchat-${message.sender_id}`,
-        });
-      }
-      loadConversations().catch(() => {});
-    });
-    socket.on('messages:read', ({ messageIds, groupId }) => {
-      const readIds = new Set(messageIds);
-      setMessages((current) => current.map((message) => {
-        if (!readIds.has(message.id)) return message;
-        const readCount = Math.min(message.recipient_count || 1, (message.read_count || 0) + 1);
-        const deliveredCount = Math.max(message.delivered_count || 0, readCount);
-        return {
-          ...message,
-          read_count: readCount,
-          delivered_count: deliveredCount,
-          is_delivered: groupId ? deliveredCount >= (message.recipient_count || 1) : true,
-          is_read: groupId ? readCount >= (message.recipient_count || 1) : true,
-        };
-      }));
-    });
-    socket.on('messages:delivered', ({ messageIds, groupId }) => {
-      const deliveredIds = new Set(messageIds);
-      setMessages((current) => current.map((message) => {
-        if (!deliveredIds.has(message.id)) return message;
-        const deliveredCount = Math.min(message.recipient_count || 1, (message.delivered_count || 0) + 1);
-        return {
-          ...message,
-          delivered_count: deliveredCount,
-          is_delivered: groupId ? deliveredCount >= (message.recipient_count || 1) : true,
-        };
-      }));
-    });
-    socket.on('group:created', (group) => {
-      setGroups((current) => current.some((item) => item.id === group.id) ? current : [group, ...current]);
-    });
-    socket.on('status:new', () => loadStatuses().catch(() => {}));
-    socket.on('status:notification', (notification) => {
-      setStatusNotifications((current) => [notification, ...current.filter((item) => item.id !== notification.id)].slice(0, 100));
-    });
+    if (!user) return undefined;
+    const showError = (loadError) => setError(loadError.message);
+    const stopConversations = subscribeToConversations(user.id, setConversations, showError);
+    const stopGroups = subscribeToGroups(user.id, setGroups, showError);
+    const stopContacts = subscribeToContacts(user.id, setContacts, showError);
+    const stopPresence = subscribeToOnlineUsers(setOnlineUsers, showError);
+    updateLastSeen(user.id).catch(showError);
+    const heartbeat = setInterval(() => updateLastSeen(user.id).catch(showError), 60_000);
     return () => {
-      alive = false;
-      socket.disconnect();
-      socketRef.current = null;
-      clearTimeout(typingTimerRef.current);
+      stopConversations();
+      stopGroups();
+      stopContacts();
+      stopPresence();
+      clearInterval(heartbeat);
     };
-  }, [token, user]);
+  }, [user?.id]);
 
   useEffect(() => {
-    if (inboxView !== 'status' || !token) return;
-    loadStatuses().catch((loadError) => setError(loadError.message));
-  }, [inboxView, token]);
+    if (!user || inboxView !== 'status') return undefined;
+    return subscribeToStatuses(user.id, setStatusUpdates, (loadError) => setError(loadError.message));
+  }, [inboxView, user?.id]);
 
   useEffect(() => {
-    if (!active || !token) { setMessages([]); return; }
-    let alive = true;
-    const historyPath = active.kind === 'group'
-      ? `/api/groups/${active.id}/messages`
-      : `/api/conversations/${active.id}/messages`;
-    api(historyPath, token).then((result) => {
-      if (alive) setMessages(result.messages);
-    }).catch((loadError) => { if (alive) setError(loadError.message); });
-    return () => { alive = false; };
-  }, [active, token]);
+    if (!active || !user) { setMessages([]); return undefined; }
+    return subscribeToMessages(active, user, setMessages, (loadError) => setError(loadError.message));
+  }, [active, user?.id]);
 
   useEffect(() => {
     messageEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
@@ -1442,16 +1151,33 @@ function App() {
   setError('');
 }
 
-  function signOut() {
-    localStorage.removeItem(TOKEN_KEY);
-    socketRef.current?.disconnect();
-    setToken(null); setUser(null); setActive(null); setConversations([]); setGroups([]); setMessages([]); setStatusUpdates([]); setSettingsOpen(false);
-    setStatusNotifications([]); setActiveStatus(null); setActiveStatusId(null); setActivityOpen(false);
+  async function signOut() {
+    try {
+      await logoutUser();
+      setActive(null);
+      setConversations([]);
+      setGroups([]);
+      setMessages([]);
+      setStatusUpdates([]);
+      setSettingsOpen(false);
+      setActiveStatus(null);
+      setActiveStatusId(null);
+    } catch (signOutError) {
+      setError(signOutError.message);
+    }
   }
 
   function openSettings(section = 'profile') {
     setSettingsSection(section);
     setSettingsOpen(true);
+  }
+
+  function openStatusActivity() {
+    setActivityOpen(true);
+  }
+
+  function openNotifiedStatus() {
+    setActivityOpen(false);
   }
 
   function updateProfile(profile) {
@@ -1461,16 +1187,7 @@ function App() {
   }
 
   async function saveContact(person, nickname) {
-    await api(`/api/contacts/${person.id}`, token, {
-      method: 'PUT',
-      body: JSON.stringify({ nickname }),
-    });
-    const savedPerson = {
-      ...person,
-      profile_name: person.profile_name || person.display_name,
-      display_name: nickname,
-      saved_as: nickname,
-    };
+    const savedPerson = await saveFirestoreContact(user.id, person, nickname);
     setContacts((current) => [savedPerson, ...current.filter((contact) => contact.id !== person.id)]);
     setConversations((current) => current.map((conversation) => conversation.id === person.id
       ? { ...conversation, display_name: nickname, saved_as: nickname, profile_name: conversation.profile_name || conversation.display_name }
@@ -1480,22 +1197,10 @@ function App() {
       : current);
   }
 
-  function emitTyping(chat, isTyping) {
-    if (!chat) return;
-    if (chat.kind === 'group') {
-      socketRef.current?.emit('typing', { groupId: chat.id, isTyping });
-    } else {
-      socketRef.current?.emit('typing', { recipientId: chat.id, isTyping });
-    }
-  }
-
   function chooseConversation(person) {
-    emitTyping(activeRef.current, false);
     setActive({ ...person, kind: 'direct' });
     setModalOpen(false);
     setMobileChat(true);
-    setContactTyping(false);
-    setTypingName('');
     setSelectedFile(null);
     setSelectedWaveform([]);
     setError('');
@@ -1505,27 +1210,22 @@ function App() {
   }
 
   function chooseGroup(group) {
-    emitTyping(activeRef.current, false);
     setActive({ ...group, kind: 'group' });
     setGroupModalOpen(false);
     setMobileChat(true);
-    setContactTyping(false);
-    setTypingName('');
     setSelectedFile(null);
     setSelectedWaveform([]);
     setError('');
   }
 
-  async function handleGroupCreated(group) {
+  function handleGroupCreated(group) {
     setGroupModalOpen(false);
-    await loadConversations();
     chooseGroup(group);
   }
 
   async function publishStatus() {
     setStatusComposerOpen(false);
     setInboxView('status');
-    await loadStatuses();
   }
 
   function removeStatus(statusId) {
@@ -1539,15 +1239,6 @@ function App() {
 
   function updateDraft(value) {
     setDraft(value);
-    if (!active) return;
-    const isTyping = Boolean(value.trim());
-    emitTyping(active, isTyping);
-    clearTimeout(typingTimerRef.current);
-    if (isTyping) {
-      typingTimerRef.current = setTimeout(() => {
-        emitTyping(active, false);
-      }, 1200);
-    }
   }
 
   function selectAttachment(event) {
@@ -1724,37 +1415,14 @@ function App() {
     setIsRecording(false);
   }
 
-  async function sendMessageContent(body, attachment, waveform = []) {
-    if ((!body && !attachment) || !active || sendingMessage) return;
+  async function sendMessageContent(body) {
+    if (!body || !active || sendingMessage) return;
     setDraft('');
     setSendingMessage(true);
-    clearTimeout(typingTimerRef.current);
-    emitTyping(active, false);
-    const formData = new FormData();
-    formData.append('body', body);
-    if (attachment) {
-      formData.append('file', attachment);
-      if (attachment.type.startsWith('audio/') && waveform.length) formData.append('waveform', JSON.stringify(waveform));
-    }
     try {
-      const messagePath = active.kind === 'group'
-        ? `/api/groups/${active.id}/messages`
-        : '/api/messages';
-      if (active.kind !== 'group') formData.append('recipientId', String(active.id));
-      const result = await api(messagePath, token, {
-        method: 'POST',
-        body: formData,
-      });
-      setMessages((current) => current.some((message) => message.id === result.message.id) ? current : [...current, result.message]);
-      setSelectedFile(null);
-      setSelectedWaveform([]);
-      await loadConversations();
+      await sendTextMessage({ chat: active, sender: user, body });
     } catch (sendError) {
       setDraft(body);
-      if (attachment) {
-        setSelectedFile(attachment);
-        setSelectedWaveform(waveform);
-      }
       setError(sendError.message);
     } finally {
       setSendingMessage(false);
@@ -1763,7 +1431,7 @@ function App() {
 
   function sendMessage(event) {
     event.preventDefault();
-    sendMessageContent(draft.trim(), selectedFile, selectedWaveform);
+    sendMessageContent(draft.trim());
   }
 
   const filteredConversations = conversations.filter((conversation) =>
@@ -1816,35 +1484,28 @@ function App() {
               const showAuthor = !previous || previous.sender_id !== message.sender_id;
               return <div className={`message-row${mine ? ' message-mine' : ''}${showAuthor ? ' message-first' : ''}`} key={message.id}>
                 {!mine && showAuthor && <Avatar name={active.kind === 'group' ? message.sender_display_name || message.sender_username : active.display_name || active.username} src={active.kind === 'group' ? '' : active.avatar_url} />}
-                <div className="message-stack">{active.kind === 'group' && showAuthor && !mine && <span className="group-message-author">{message.sender_display_name || message.sender_username}</span>}{message.body && <div className="message-bubble">{message.body}</div>}{message.attachment && <AttachmentCard attachment={message.attachment} token={token} />}<span className="message-time">{relativeTime(message.created_at)}{mine && <span className={`message-read-receipt${messageSeen ? ' is-read' : messageDelivered ? ' is-delivered' : ''}`} title={active.kind === 'group' ? `${message.delivered_count || 0} delivered · ${message.read_count || 0} seen` : messageSeen ? 'Seen' : messageDelivered ? 'Delivered' : 'Sent'}>{active.kind === 'group' && message.read_count > 0 && <small>{message.read_count}/{message.recipient_count}</small>}{messageSeen || messageDelivered ? <CheckCheck size={14} /> : <Check size={13} />}</span>}</span></div>
+                <div className="message-stack">{active.kind === 'group' && showAuthor && !mine && <span className="group-message-author">{message.sender_display_name || message.sender_username}</span>}{message.body && <div className="message-bubble">{message.body}</div>}<span className="message-time">{relativeTime(message.created_at)}{mine && <span className={`message-read-receipt${messageSeen ? ' is-read' : messageDelivered ? ' is-delivered' : ''}`} title={active.kind === 'group' ? `${message.delivered_count || 0} delivered · ${message.read_count || 0} seen` : messageSeen ? 'Seen' : messageDelivered ? 'Delivered' : 'Sent'}>{active.kind === 'group' && message.read_count > 0 && <small>{message.read_count}/{message.recipient_count}</small>}{messageSeen || messageDelivered ? <CheckCheck size={14} /> : <Check size={13} />}</span>}</span></div>
               </div>;
             })}
             <div ref={messageEndRef} />
           </div>
           {error && <div className="chat-error" role="alert">{error}<button onClick={() => setError('')} aria-label="Dismiss"><X size={14} /></button></div>}
-          {selectedFile && <div className="attachment-draft"><FileText size={17} /><span><strong>{selectedFile.name}</strong><small>{formatFileSize(selectedFile.size)}</small></span><button className="icon-button" onClick={() => setSelectedFile(null)} type="button" aria-label="Remove attachment"><X size={15} /></button></div>}
-          {(isRecording || startingRecording) && <div className={`voice-recording-status${cancelVoiceSwipe ? ' voice-cancel-pending' : ''}`} role="status"><span className="voice-recording-dot" />{startingRecording ? 'Waiting for microphone…' : `Recording ${String(Math.floor(recordingSeconds / 60)).padStart(2, '0')}:${String(recordingSeconds % 60).padStart(2, '0')}`}<span className="recording-waveform" aria-label="Live voice waveform">{recordingWaveform.slice(-36).map((amplitude, index) => <i key={index} style={{ height: `${Math.round(20 + amplitude * 80)}%` }} />)}</span><span className="voice-recording-hint">{cancelVoiceSwipe ? 'Release to cancel' : 'Release to send · slide left to cancel'}</span>{isRecording && <><button type="button" onClick={() => stopVoiceRecording(false, true)}>Send now</button><button type="button" onClick={() => stopVoiceRecording(true)}>Cancel</button></>}</div>}
-                    {selectedFile && <div className="attachment-draft"><FileText size={17} /><span><strong>{selectedFile.name}</strong><small>{formatFileSize(selectedFile.size)}</small></span><button className="icon-button" onClick={() => { setSelectedFile(null); setSelectedWaveform([]); }} type="button" aria-label="Remove attachment"><X size={15} /></button></div>}
           <form className="composer" onSubmit={sendMessage}>
-            <input ref={photoInputRef} className="hidden-file-input" type="file" accept="image/*,video/*" onChange={selectAttachment} />
-            <input ref={fileInputRef} className="hidden-file-input" type="file" onChange={selectAttachment} />
-            <button className="composer-tool" type="button" onClick={() => photoInputRef.current?.click()} aria-label="Add photo or video" title="Add photo or video" disabled={isRecording || sendingMessage}><ImagePlus size={19} /></button>
-            <button className="composer-tool" type="button" onClick={() => fileInputRef.current?.click()} aria-label="Attach file" title="Attach file" disabled={isRecording || sendingMessage}><Paperclip size={18} /></button>
-            <input value={draft} onChange={(event) => updateDraft(event.target.value)} placeholder={`Message ${active.kind === 'group' ? active.name : active.display_name || active.username}…`} maxLength={4000} aria-label="Message" disabled={isRecording || startingRecording} />
+            <input value={draft} onChange={(event) => updateDraft(event.target.value)} placeholder={`Message ${active.kind === 'group' ? active.name : active.display_name || active.username}…`} maxLength={4000} aria-label="Message" />
             <span className="composer-divider" />
-            {draft.trim() || selectedFile ? <button type="submit" className="send-button" disabled={sendingMessage || isRecording} aria-label="Send message" title="Send message"><Send size={17} /></button> : <button className={`composer-tool voice-record-button${isRecording ? ' voice-recording' : ''}`} type="button" onPointerDown={beginVoicePress} onPointerMove={moveVoicePress} onPointerUp={endVoicePress} onPointerCancel={(event) => endVoicePress(event, true)} onClick={(event) => { if (event.detail === 0 && !isRecording) startVoiceRecording(); }} disabled={sendingMessage} aria-label="Hold to record voice note" title="Hold to record; release to send"><Mic size={18} /></button>}
+            <button type="submit" className="send-button" disabled={!draft.trim() || sendingMessage} aria-label="Send message" title="Send message"><Send size={17} /></button>
           </form>
-          <div className="chat-privacy"><LockKeyhole size={12} /> Messages are stored on your FarazChat server.</div>
+          <div className="chat-privacy"><LockKeyhole size={12} /> Messages are stored in your Firebase account.</div>
         </> : <div className="welcome-panel"><div className="welcome-illustration"><div className="welcome-orbit orbit-one" /><div className="welcome-orbit orbit-two" /><span className="welcome-icon"><MessageCircle size={35} /></span><span className="orbit-dot dot-one" /><span className="orbit-dot dot-two" /><span className="orbit-dot dot-three" /></div><span className="welcome-eyebrow">A SPACE OF YOUR OWN</span><h2>Make room for<br />a good <span>conversation.</span></h2><p>Choose someone you know, or find a new face by their username.</p><button className="primary-button welcome-button" onClick={() => setModalOpen(true)}><Plus size={17} /> Start a new chat</button><span className="welcome-bottom"><Check size={14} /> Your messages, delivered in real time</span></div>}
       </section>
-      {modalOpen && <NewChatModal token={token} onClose={() => setModalOpen(false)} onSelect={chooseConversation} />}
-      {groupModalOpen && <GroupModal token={token} onClose={() => setGroupModalOpen(false)} onCreate={handleGroupCreated} />}
-      {statusComposerOpen && <StatusComposerModal token={token} onClose={() => setStatusComposerOpen(false)} onPublished={publishStatus} />}
+      {modalOpen && <NewChatModal onClose={() => setModalOpen(false)} onSelect={chooseConversation} />}
+      {groupModalOpen && <GroupModal user={user} onClose={() => setGroupModalOpen(false)} onCreate={handleGroupCreated} />}
+      {statusComposerOpen && <StatusComposerModal user={user} onClose={() => setStatusComposerOpen(false)} onPublished={publishStatus} />}
       {activityOpen && <StatusActivityModal notifications={statusNotifications} onClose={() => setActivityOpen(false)} onOpenStatus={openNotifiedStatus} />}
-      {activeStatus && <StatusViewerModal key={`${activeStatus.user.id}-${activeStatusId || activeStatus.statuses[0]?.id}`} token={token} update={activeStatus} initialStatusId={activeStatusId} onClose={() => { setActiveStatus(null); setActiveStatusId(null); }} onOpenChat={(person) => { setActiveStatus(null); setActiveStatusId(null); chooseConversation(person); }} onDelete={removeStatus} />}
-      {groupDetailsOpen && active?.kind === 'group' && <GroupDetailsModal token={token} group={active} onClose={() => setGroupDetailsOpen(false)} />}
-      {settingsOpen && <SettingsModal token={token} user={user} initialSection={settingsSection} chatWallpaper={chatWallpaper} onWallpaperChange={setChatWallpaper} theme={theme} onThemeChange={setTheme} onClose={() => setSettingsOpen(false)} onSave={updateProfile} onSignOut={signOut} />}
-      {contactProfileOpen && active && <ContactProfileModal token={token} person={active} online={onlineUsers.has(active.id)} savedName={contacts.find((contact) => contact.id === active.id)?.nickname || active.saved_as} onSaveContact={saveContact} onClose={() => setContactProfileOpen(false)} />}
+      {activeStatus && <StatusViewerModal key={`${activeStatus.user.id}-${activeStatusId || activeStatus.statuses[0]?.id}`} user={user} update={activeStatus} initialStatusId={activeStatusId} onClose={() => { setActiveStatus(null); setActiveStatusId(null); }} onOpenChat={(person) => { setActiveStatus(null); setActiveStatusId(null); chooseConversation(person); }} onDelete={removeStatus} />}
+      {groupDetailsOpen && active?.kind === 'group' && <GroupDetailsModal group={active} onClose={() => setGroupDetailsOpen(false)} />}
+      {settingsOpen && <SettingsModal user={user} initialSection={settingsSection} chatWallpaper={chatWallpaper} onWallpaperChange={setChatWallpaper} theme={theme} onThemeChange={setTheme} onClose={() => setSettingsOpen(false)} onSave={updateProfile} onSignOut={signOut} />}
+      {contactProfileOpen && active && <ContactProfileModal person={active} online={onlineUsers.has(active.id)} savedName={contacts.find((contact) => contact.id === active.id)?.nickname || active.saved_as} onSaveContact={saveContact} onClose={() => setContactProfileOpen(false)} />}
     </main>
   );
 }

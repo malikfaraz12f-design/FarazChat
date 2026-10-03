@@ -1,6 +1,6 @@
 # FarazChat
 
-A small, self-hosted real-time chat app with 8-digit contact-code accounts, editable display names and bios, exact-code search, private saved contact names, and persistent one-to-one conversations.
+FarazChat is a React, Vite, and Capacitor messenger. Accounts use a unique 8-digit contact code and Firebase Authentication; app data is stored in Cloud Firestore. Profile photos are compressed to a maximum 400px JPEG at 70% quality and saved as base64 in the user profile. Attachments and voice notes are currently disabled.
 
 ## Run locally
 
@@ -11,15 +11,24 @@ npm install
 npm run dev
 ```
 
-Open the Vite URL shown in the terminal (usually http://localhost:5173). Create two accounts in separate browser profiles to try live messaging. Registration is a four-step flow: choose a unique 8-digit code, set and confirm a password, add a profile name/photo, then add a bio and accept the policies. Log in with the code and password; existing accounts receive a migrated code and can still use their old username during transition. Search requires the complete code, and saved contact names are private to the account that saves them. Lost passwords cannot be recovered; signed-in users can change them in Account settings. Signup also explains server storage and status expiry. The gear opens profile, photo, code-search privacy, notifications, dark mode, and password settings. Open a chat header to view/save a member profile. The inbox has Chats, Groups, and Status tabs. Create a group from the people icon, or post text/photo/video/emoji statuses that expire after 24 hours. Chat shows live online/offline and typing status, and supports photos and files up to 15 MB with member-only downloads. Messages, groups, statuses, preferences, and contact names are stored in `data/farazchat.sqlite`; attachment files persist under `data/message-files`, profile photos under `data/avatars`, and status media under `data/status-files`. Expired status media is cleaned automatically. Passwords are hashed with bcrypt, sign-out asks for confirmation, and notifications require browser permission. Existing accounts and direct messages keep working through additive database migrations. The local database and session-signing secret are excluded from git.
+The Firebase web configuration is in `src/firebase.js`. Use the configuration for your Firebase project, enable Email/Password authentication, and create a Cloud Firestore database. The app maps each contact code to an internal Firebase email address; users still sign in with their code and password.
 
-## Production
+## Firestore data
+
+- `users/{uid}` stores `id`, `contactCode`, `displayName`, `avatarBase64`, `notificationsEnabled`, and `lastSeen` alongside profile preferences.
+- `messages/{messageId}` stores text only. Direct messages include `conversationId`, `senderId`, `recipientId`, and `participants`; group messages include `groupId` and `participants`.
+- `groups/{groupId}` stores its name, creator, member IDs, and latest text preview.
+- `contacts/{ownerId_contactId}` stores a private nickname with `ownerId` and `contactId`.
+- `statuses/{statusId}` stores text, `ownerId`, and an `expiresAt` timestamp 24 hours after publication. Expired statuses are hidden by the app and the current user's expired documents are cleaned up when the status view is opened. For background deletion, enable a Firestore TTL policy on `statuses.expiresAt` in Google Cloud; client cleanup alone cannot run while the app is closed.
+
+Firestore Security Rules must permit authenticated users to read discoverable user profiles, read/write their own profile and contacts, read messages where they are a participant, read/write groups where they are a member, and read active statuses while restricting status creation/deletion to the owner. Rules are managed in the Firebase project and are not included in this repository, so verify they cover these collections before deployment.
+
+Online presence is based on `lastSeen` within the previous five minutes. Typing indicators and delivery/read receipts are not currently provided.
+
+## Android
+
+After setting the Firebase configuration and building the web app, sync the Capacitor project and build the Android app with:
 
 ```sh
-npm run build
-npm start
+npm run android:apk
 ```
-
-The production server serves the built app on port 3000 by default. Set `PORT` to change it and keep the `data` directory on persistent storage. Deploy the app server over HTTPS and back up its data directory. This is a small private chat app, not an end-to-end encrypted service; messages are stored in readable form on the server.
-
-For Android, deploy the server over HTTPS before opening the app. On first launch, enter the server's base URL (for example, `https://chat.example.com`); the address is saved on that device. To bake it into an APK instead, set `VITE_API_BASE_URL` when running `npm run android:apk`. If you host the web client on a separate domain, add its origin to the server's comma-separated `CORS_ORIGINS` environment variable. Capacitor's Android and iOS origins are allowed by default.
