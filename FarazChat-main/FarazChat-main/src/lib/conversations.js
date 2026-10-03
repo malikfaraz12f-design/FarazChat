@@ -10,8 +10,14 @@ async function mapConversations(snapshot, userId) {
   const latestByPerson = new Map();
   snapshot.docs.forEach((messageDoc) => {
     const message = messageDoc.data();
-    if (message.groupId || !message.participants?.includes(userId)) return;
-    const otherId = message.senderId === userId ? message.recipientId : message.senderId;
+    if (message.groupId) return;
+    const senderId = message.senderId || message.sender_id;
+    const recipientId = message.recipientId || message.recipient_id;
+    const otherId = senderId === userId
+      ? recipientId
+      : recipientId === userId
+        ? senderId
+        : message.participants?.find((participantId) => participantId !== userId);
     if (!otherId) return;
     const previous = latestByPerson.get(otherId);
     if (!previous || toDate(message.createdAt) > toDate(previous.createdAt)) {
@@ -41,11 +47,19 @@ async function mapConversations(snapshot, userId) {
 
 export function subscribeToConversations(userId, onConversations, onError) {
   try {
-    const messagesQuery = query(collection(db, 'messages'), where('participants', 'array-contains', userId));
+    const messagesQueries = [
+      query(collection(db, 'messages'), where('participants', 'array-contains', userId)),
+      query(collection(db, 'messages'), where('senderId', '==', userId)),
+      query(collection(db, 'messages'), where('recipientId', '==', userId)),
+    ];
+    const snapshots = messagesQueries.map(() => new Map());
     let requestId = 0;
-    return onSnapshot(messagesQuery, (snapshot) => {
+    const unsubscribes = messagesQueries.map((messagesQuery, index) => onSnapshot(messagesQuery, (snapshot) => {
+      snapshots[index] = new Map(snapshot.docs.map((item) => [item.id, item]));
+      const uniqueMessages = new Map();
+      snapshots.forEach((items) => items.forEach((item, id) => uniqueMessages.set(id, item)));
       const currentRequest = ++requestId;
-      mapConversations(snapshot, userId)
+      mapConversations({ docs: [...uniqueMessages.values()] }, userId)
         .then((conversations) => {
           if (currentRequest === requestId) onConversations(conversations);
         })
@@ -56,7 +70,8 @@ export function subscribeToConversations(userId, onConversations, onError) {
     }, (error) => {
       console.error('Conversation subscription error:', error);
       onError?.(new Error(error.message || 'Could not subscribe to conversations.'));
-    });
+    }))
+    return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
   } catch (error) {
     console.error('Conversation subscription setup error:', error);
     onError?.(new Error(error.message || 'Could not load conversations.'));
@@ -66,8 +81,15 @@ export function subscribeToConversations(userId, onConversations, onError) {
 
 export async function getConversations(userId) {
   try {
-    const messages = await getDocs(query(collection(db, 'messages'), where('participants', 'array-contains', userId)));
-    return await mapConversations(messages, userId);
+    const messageQueries = [
+      query(collection(db, 'messages'), where('participants', 'array-contains', userId)),
+      query(collection(db, 'messages'), where('senderId', '==', userId)),
+      query(collection(db, 'messages'), where('recipientId', '==', userId)),
+    ];
+    const snapshots = await Promise.all(messageQueries.map((messagesQuery) => getDocs(messagesQuery)));
+    const uniqueMessages = new Map();
+    snapshots.forEach((snapshot) => snapshot.docs.forEach((item) => uniqueMessages.set(item.id, item)));
+    return await mapConversations({ docs: [...uniqueMessages.values()] }, userId);
   } catch (error) {
     console.error('Conversation load error:', error);
     throw new Error(error.message || 'Could not load conversations.');

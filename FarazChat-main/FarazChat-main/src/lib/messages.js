@@ -53,17 +53,23 @@ export function subscribeToMessages(chat, currentUser, onMessages, onError) {
       }, reportError);
     }
 
-    const directMessagesQuery = query(
-      collection(db, 'messages'),
-      where('participants', 'array-contains', currentUser.id),
-    );
-    return onSnapshot(directMessagesQuery, (snapshot) => {
-      const matches = snapshot.docs
+    const messageQueries = [
+      query(collection(db, 'messages'), where('participants', 'array-contains', currentUser.id)),
+      query(collection(db, 'messages'), where('senderId', '==', currentUser.id)),
+      query(collection(db, 'messages'), where('recipientId', '==', currentUser.id)),
+    ];
+    const snapshots = messageQueries.map(() => new Map());
+    const unsubscribe = messageQueries.map((messageQuery, index) => onSnapshot(messageQuery, (snapshot) => {
+      snapshots[index] = new Map(snapshot.docs.map((item) => [item.id, item]));
+      const uniqueMessages = new Map();
+      snapshots.forEach((items) => items.forEach((item, id) => uniqueMessages.set(id, item)));
+      const matches = [...uniqueMessages.values()]
         .filter((item) => matchesDirectChat(item.data(), currentUser.id, chat.id))
         .map(toMessage)
         .sort((left, right) => new Date(left.created_at) - new Date(right.created_at));
       onMessages(matches);
-    }, reportError);
+    }, reportError));
+    return () => unsubscribe.forEach((stop) => stop());
   } catch (error) {
     console.error('Message subscription setup error:', error);
     onError?.(new Error(error.message || 'Could not load messages.'));
@@ -115,12 +121,26 @@ export async function sendTextMessage({ chat, sender, body }) {
       payload.recipientId = chat.id;
       payload.participants = [sender.id, chat.id];
     }
-    const reference = await addDoc(collection(db, 'messages'), payload);
+    let reference;
     if (chat.kind === 'group') {
+      reference = await addDoc(collection(db, 'messages'), payload);
       await updateDoc(doc(db, 'groups', chat.id), {
         lastMessage: text,
         lastMessageAt: serverTimestamp(),
       });
+    } else {
+      reference = doc(collection(db, 'messages'));
+      const participants = [sender.id, chat.id].sort();
+      const conversation = doc(db, 'conversations', directConversationId(sender.id, chat.id));
+      const batch = writeBatch(db);
+      batch.set(reference, payload);
+      batch.set(conversation, {
+        participants,
+        lastMessage: text,
+        lastMessageAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }, { merge: true });
+      await batch.commit();
     }
     return { id: reference.id, ...payload, created_at: new Date().toISOString(), sender_id: sender.id, group_id: payload.groupId || null };
   } catch (error) {

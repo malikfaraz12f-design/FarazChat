@@ -19,31 +19,57 @@ service cloud.firestore {
     match /messages/{messageId} {
       allow read: if signedIn() && (
         (resource.data.participants is list && request.auth.uid in resource.data.participants)
+        || ('senderId' in resource.data && resource.data.senderId == request.auth.uid)
+        || ('recipientId' in resource.data && resource.data.recipientId == request.auth.uid)
         || ('groupId' in resource.data
           && resource.data.groupId is string
           && isGroupMember(resource.data.groupId))
       );
       allow create: if signedIn()
         && request.resource.data.senderId == request.auth.uid
-        && request.resource.data.participants is list
-        && request.auth.uid in request.resource.data.participants
         && (
           ('groupId' in request.resource.data
             && request.resource.data.groupId is string
-            && isGroupMember(request.resource.data.groupId))
+            && isGroupMember(request.resource.data.groupId)
+            && request.resource.data.participants is list
+            && request.auth.uid in request.resource.data.participants)
           || ('recipientId' in request.resource.data
             && request.resource.data.recipientId is string
-            && request.resource.data.recipientId in request.resource.data.participants)
+            && request.resource.data.recipientId != request.auth.uid
+            && (!('participants' in request.resource.data)
+              || (request.resource.data.participants is list
+                && request.auth.uid in request.resource.data.participants
+                && request.resource.data.recipientId in request.resource.data.participants)))
         );
       allow update: if signedIn()
         && 'recipientId' in resource.data
         && resource.data.recipientId == request.auth.uid
         && resource.data.senderId != request.auth.uid
-        && resource.data.participants is list
-        && request.auth.uid in resource.data.participants
         && (!('read' in resource.data) || resource.data.read == false)
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read'])
         && request.resource.data.read == true;
+    }
+
+    match /conversations/{conversationId} {
+      allow read: if signedIn()
+        && resource.data.participants is list
+        && request.auth.uid in resource.data.participants;
+      allow create: if signedIn()
+        && request.resource.data.participants is list
+        && request.resource.data.participants.size() == 2
+        && request.auth.uid in request.resource.data.participants
+        && request.resource.data.lastMessage is string;
+      allow update: if signedIn()
+        && resource.data.participants is list
+        && request.auth.uid in resource.data.participants
+        && request.resource.data.participants is list
+        && resource.data.participants.size() == 2
+        && request.resource.data.participants.size() == 2
+        && resource.data.participants.hasAll(request.resource.data.participants)
+        && request.resource.data.participants.hasAll(resource.data.participants)
+        && request.auth.uid in request.resource.data.participants
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastMessage', 'lastMessageAt', 'updatedAt'])
+        && request.resource.data.lastMessage is string;
     }
 
     match /groups/{groupId} {
