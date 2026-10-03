@@ -141,14 +141,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .first-message .avatar-large { width: 54px; height: 54px; flex-basis: 54px; margin-bottom: 5px; font-size: 19px; }
 .first-message strong { color: #555e56; font-size: 13px; font-weight: 600; }
 .first-message-rule { width: 28px; height: 2px; margin-top: 7px; border-radius: 2px; background: #75ad83; }
-.message-row { width: 100%; display: flex; align-items: end; gap: 7px; }
+.message-row { width: 100%; display: flex; align-items: end; gap: 7px; font-size: 15px; }
 .message-row .avatar { width: 25px; height: 25px; flex-basis: 25px; font-size: 9px; }
 .message-row:not(.message-first) .avatar { visibility: hidden; }
 .message-row.message-mine { justify-content: flex-end; }
 .message-stack { max-width: min(73%, 470px); display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
 .message-mine .message-stack { align-items: flex-end; }
-.message-bubble { position: relative; padding: 10px 13px; border: 1px solid #dfe9e2; border-left: 3px solid #78a88a; border-radius: 4px 14px 14px 14px; background: #fcfefc; color: #35443b; font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; box-shadow: 0 4px 12px rgba(35, 60, 45, .055); }
-.message-mine .message-bubble { border-color: #c4e2ce; border-right: 3px solid #268362; border-left-width: 1px; border-radius: 14px 4px 14px 14px; background: #e1f3e7; color: #294737; }
+.message-bubble { position: relative; padding: 10px 13px; border: 1px solid #dfe9e2; border-left: 3px solid #78a88a; border-radius: 4px 14px 14px 14px; background: #fcfefc; color: #222; -webkit-text-fill-color: currentColor; font-size: 15px; line-height: 1.6; opacity: 1; visibility: visible; white-space: pre-wrap; overflow-wrap: anywhere; box-shadow: 0 4px 12px rgba(35, 60, 45, .055); }
+.message-mine .message-bubble { border-color: #c4e2ce; border-right: 3px solid #268362; border-left-width: 1px; border-radius: 14px 4px 14px 14px; background: #e1f3e7; color: #222; }
 .message-time { display: inline-flex; align-items: center; gap: 3px; padding: 0 3px; color: #969d96; font-size: 8px; }
 .message-read-receipt { display: inline-flex; align-items: center; gap: 2px; color: #8b999b; }
 .message-read-receipt.is-delivered { color: #8b999b; }
