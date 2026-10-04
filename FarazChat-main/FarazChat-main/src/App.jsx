@@ -1299,7 +1299,6 @@ function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [selectedWaveform, setSelectedWaveform] = useState([]);
   const [isRecording, setIsRecording] = useState(false);
-  const [recordingPaused, setRecordingPaused] = useState(false);
   const [startingRecording, setStartingRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   useEffect(() => {
@@ -1307,10 +1306,9 @@ function App() {
       setRecordingSeconds(0);
       return undefined;
     }
-    if (recordingPaused) return undefined;
     const timer = setInterval(() => setRecordingSeconds((seconds) => seconds + 1), 1000);
     return () => clearInterval(timer);
-  }, [isRecording, recordingPaused]);
+  }, [isRecording]);
   const [recordingWaveform, setRecordingWaveform] = useState(() => compactWaveform([]));
   const [cancelVoiceSwipe, setCancelVoiceSwipe] = useState(false);
   const [sendingMessage, setSendingMessage] = useState(false);
@@ -1615,6 +1613,7 @@ function App() {
   }
 
   async function startVoiceRecording() {
+  if (startingRecording || isRecording || sendingMessage) return;
   if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
     setError('Voice recording is not supported by this browser.');
     return;
@@ -1692,7 +1691,6 @@ function App() {
       recordingPointerRef.current = null;
       setCancelVoiceSwipe(false);
       setIsRecording(false);
-      setRecordingPaused(false);
       setRecordingSeconds(0);
       if (cancelRecordingRef.current) {
         cancelRecordingRef.current = false;
@@ -1724,16 +1722,7 @@ function App() {
 
     recorder.start(1000);
     setIsRecording(true);
-    setRecordingPaused(false);
     setRecordingSeconds(0);
-
-    if (recordingPointerRef.current?.released) {
-      const pointerState = recordingPointerRef.current;
-      recordingPointerRef.current = null;
-      cancelRecordingRef.current = pointerState.cancelled;
-      sendVoiceOnStopRef.current = !pointerState.cancelled;
-      recorder.stop();
-    }
   } catch (recordingError) {
     stream?.getTracks().forEach((track) => track.stop());
     recordingPointerRef.current = null;
@@ -1755,23 +1744,8 @@ function App() {
     setIsRecording(false);
   }
 
-  function toggleVoicePause() {
-    const recorder = recorderRef.current;
-    if (!recorder || recorder.state === 'inactive') return;
-    if (recorder.state === 'paused') {
-      recorder.resume();
-      setRecordingPaused(false);
-    } else if (recorder.state === 'recording') {
-      recorder.pause();
-      setRecordingPaused(true);
-    }
-  }
-
-  function beginVoicePress(event) {
-    if (event.button !== 0 || startingRecording || sendingMessage || selectedFile) return;
-    event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    recordingPointerRef.current = { id: event.pointerId, startX: event.clientX, cancelled: false, released: false };
+  function beginVoicePress() {
+    if (startingRecording || sendingMessage || selectedFile) return;
     startVoiceRecording();
   }
 
@@ -1782,19 +1756,18 @@ function App() {
     setCancelVoiceSwipe(pointerState.cancelled);
   }
 
-  function endVoicePress(event, cancelled = false) {
+  function beginVoiceSwipe(event) {
+    if (event.target.closest('button')) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    recordingPointerRef.current = { id: event.pointerId, startX: event.clientX, cancelled: false };
+  }
+
+  function endVoiceSwipe(event) {
     const pointerState = recordingPointerRef.current;
     if (!pointerState || pointerState.id !== event.pointerId) return;
-    pointerState.released = true;
-    pointerState.cancelled ||= cancelled || event.clientX < pointerState.startX - 72;
-    const recorder = recorderRef.current;
-    if (!recorder || recorder.state === 'inactive') return;
     recordingPointerRef.current = null;
-    cancelRecordingRef.current = pointerState.cancelled;
-    sendVoiceOnStopRef.current = !pointerState.cancelled;
     setCancelVoiceSwipe(false);
-    recorder.stop();
-    setIsRecording(false);
+    if (pointerState.cancelled || event.clientX < pointerState.startX - 72) stopVoiceRecording(true);
   }
 
   async function sendMessageContent(body, voiceFile = null, waveform = []) {
@@ -1982,12 +1955,16 @@ function App() {
   </button>
   <input value={draft} onChange={(event) => updateDraft(event.target.value)} placeholder={`Message ${active.kind === 'group' ? active.name : active.display_name || active.username}…`} maxLength={4000} aria-label="Message" />
   <span className="composer-divider" />
-  {draft.trim() ? (
+  {isRecording ? (
+    <button type="button" className="send-button voice-send-button" onClick={() => stopVoiceRecording(false, true)} aria-label="Send voice note" title="Send voice note" disabled={sendingMessage}>
+      <Send size={17} />
+    </button>
+  ) : draft.trim() ? (
     <button type="submit" className="send-button" disabled={sendingMessage || !canSendToActive} aria-label="Send message" title="Send message">
       <Send size={17} />
     </button>
   ) : (
-    <button type="button" className="voice-record-button" onPointerDown={beginVoicePress} onPointerMove={moveVoicePress} onPointerUp={(event) => endVoicePress(event)} onPointerCancel={(event) => endVoicePress(event, true)} aria-label="Hold to record voice note" title="Hold to record voice note" disabled={startingRecording || sendingMessage}>
+    <button type="button" className="voice-record-button" onClick={beginVoicePress} aria-label="Start voice note" title="Tap to record voice note" disabled={startingRecording || sendingMessage}>
       <Mic size={19} />
     </button>
   )}
@@ -2000,7 +1977,14 @@ function App() {
   </div>
 )}
 {isRecording && (
-  <div className={`voice-recording-indicator${cancelVoiceSwipe ? ' voice-cancel-pending' : ''}`}>
+  <div
+    className={`voice-recording-indicator${cancelVoiceSwipe ? ' voice-cancel-pending' : ''}`}
+    onPointerDown={beginVoiceSwipe}
+    onPointerMove={moveVoicePress}
+    onPointerUp={endVoiceSwipe}
+    onPointerCancel={endVoiceSwipe}
+  >
+    <button type="button" className="voice-cancel-button" onClick={() => stopVoiceRecording(true)} aria-label="Cancel voice note" title="Cancel recording"><Trash2 size={17} /></button>
     <span className="recording-dot" />
     <span className="recording-timer">{formatAudioTime(recordingSeconds)}</span>
     <div className="recording-waveform">
@@ -2009,11 +1993,6 @@ function App() {
       ))}
     </div>
     <span className="recording-hint">{cancelVoiceSwipe ? 'Release to cancel' : 'Slide to cancel'}</span>
-    <div className="voice-recording-actions">
-      <button type="button" onClick={() => stopVoiceRecording(true)} aria-label="Discard voice note" title="Discard"><Trash2 size={17} /></button>
-      <button type="button" onClick={toggleVoicePause} aria-label={recordingPaused ? 'Resume recording' : 'Pause recording'} title={recordingPaused ? 'Resume' : 'Pause'}>{recordingPaused ? <Play size={16} /> : <Pause size={16} />}</button>
-      <button type="button" className="voice-send-button" onClick={() => stopVoiceRecording(false, true)} aria-label="Send voice note" title="Send"><Send size={15} /></button>
-    </div>
   </div>
 )}
 {selectedFile && (
