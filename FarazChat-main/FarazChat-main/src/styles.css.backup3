@@ -875,21 +875,3 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline-colo
   margin-left: 4px;
   vertical-align: middle;
   filter: drop-shadow(0 0 3px rgba(33, 150, 243, 0.6));
-
-}
-.chat-wallpaper-overlay {
-  position: absolute;
-  inset: 0;
-  background: rgba(255, 255, 255, var(--wallpaper-opacity, 0.3));
-  pointer-events: none;
-  z-index: 1;
-}
-
-.message-stage {
-  position: relative;
-}
-
-.message-stage > *:not(.chat-wallpaper-overlay) {
-  position: relative;
-  z-index: 2;
-}

@@ -1,5 +1,3 @@
-import { requestNotificationPermission, onForegroundMessage } from './lib/notifications';
-import { auth } from './firebase';
 import { searchUserByCode, getMyProfile, updateUserProfile } from './lib/users';
 import { registerUser, loginUser, logoutUser, changeUserPassword, onAuthChange, isCodeAvailable } from './lib/auth';
 import { subscribeToConversations } from './lib/conversations';
@@ -1034,8 +1032,8 @@ function SettingsModal({ user, initialSection, chatWallpaper, onWallpaperChange,
   const [displayName, setDisplayName] = useState(user.display_name || user.username);
   const [bio, setBio] = useState(user.bio || '');
   const [notificationsEnabled, setNotificationsEnabled] = useState(Boolean(user.notifications_enabled));
-  const [allowMessages, setAllowMessages] = useState(user.allow_messages !== false);
   const [discoverable, setDiscoverable] = useState(user.discoverable !== false);
+  const [allowMessages, setAllowMessages] = useState(user.allow_messages !== false);
   const [photoPreview, setPhotoPreview] = useState(user.avatar_url || '');
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -1066,7 +1064,6 @@ function SettingsModal({ user, initialSection, chatWallpaper, onWallpaperChange,
         const permission = Notification.permission === 'default'
           ? await Notification.requestPermission()
           : Notification.permission;
-        await requestNotificationPermission();
         if (permission !== 'granted') {
           setError('Allow notifications in your browser settings to turn this on.');
           return;
@@ -1085,7 +1082,7 @@ function SettingsModal({ user, initialSection, chatWallpaper, onWallpaperChange,
     setNotice('');
     setBusy(true);
     try {
-      const profile = await updateUserProfile(auth.currentUser?.uid || user.id, {
+      const profile = await updateUserProfile(user.id, {
         displayName: includeProfile ? displayName : user.displayName || user.display_name || user.username,
         bio: includeProfile ? bio : user.bio || '',
         notificationsEnabled: changes.notificationsEnabled ?? notificationsEnabled,
@@ -1180,7 +1177,7 @@ function SettingsModal({ user, initialSection, chatWallpaper, onWallpaperChange,
     setBusy(true);
     try {
       const avatarBase64 = await compressImage(file);
-      const profile = await updateUserProfile(auth.currentUser?.uid || user.id, { avatarBase64 });
+      const profile = await updateUserProfile(user.id, { avatarBase64 });
       setPhotoPreview(profile.avatar_url);
       onSave(profile);
       setNotice('Profile photo updated.');
@@ -1465,7 +1462,7 @@ function App() {
     const nextBlockedIds = blockedUserIds.includes(person.id)
       ? blockedUserIds.filter((blockedId) => blockedId !== person.id)
       : [...blockedUserIds, person.id];
-    const profile = await updateUserProfile(auth.currentUser?.uid || user.id, { blockedUserIds: nextBlockedIds });
+    const profile = await updateUserProfile(user.id, { blockedUserIds: nextBlockedIds });
     updateProfile(profile);
   }
 

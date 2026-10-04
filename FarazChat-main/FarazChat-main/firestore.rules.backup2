@@ -175,8 +175,8 @@ service cloud.firestore {
       allow delete: if signedIn() && resource.data.ownerId == request.auth.uid;
     }
   }
-    
-    match /typing/{typingId} {
-      allow get, list, write: if request.auth != null;
-    }
+}
+// typing collection
+match /typing/{typingId} {
+  allow get, list, write: if request.auth != null;
 }

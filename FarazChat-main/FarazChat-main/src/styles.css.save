@@ -57,6 +57,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .profile-textarea::placeholder { color: #a3a9a2; }
   .auth-footer span:first-child { font-weight: 700; letter-spacing: 1.2px; color: #73839a; }
 .signup-bio { min-height: 66px; }
+
 .primary-button { height: 45px; display: inline-flex; align-items: center; justify-content: center; gap: 12px; border: 0; border-radius: 5px; background: #24835e; color: white; font-size: 13px; font-weight: 600; cursor: pointer; transition: background .18s, transform .18s; }
 .primary-button:hover { background: #196d4c; transform: translateY(-1px); }
 .primary-button:disabled { cursor: wait; opacity: .7; }
