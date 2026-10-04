@@ -4,7 +4,7 @@ import { auth } from './firebase';
 import { searchUserByCode, getMyProfile, updateUserProfile } from './lib/users';
 import { registerUser, loginUser, logoutUser, changeUserPassword, onAuthChange, isCodeAvailable } from './lib/auth';
 import { subscribeToConversations } from './lib/conversations';
-import { editMessage, markMessagesAsRead, sendTextMessage, subscribeToMessages, toggleMessageReaction } from './lib/messages';
+import { editMessage, markMessagesAsRead, sendTextMessage, sendVoiceNoteMessage, subscribeToMessages, toggleMessageReaction } from './lib/messages';
 import {
   addGroupMember as addFirestoreGroupMember,
   createGroup,
@@ -30,7 +30,7 @@ import { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft, Bell, Camera, Check, CheckCheck, Copy, Download, Eye, FileText, Forward, Heart, ImagePlus, KeyRound, LockKeyhole,
   LogOut, MessageCircle, Mic, Moon, MoreHorizontal, Paperclip, Pause, Pencil, Play, Plus, Reply, Search, Send, Settings,
-  Shield, ShieldCheck, Smile, UserRound, UsersRound, X,
+  Shield, ShieldCheck, Smile, Trash2, UserRound, UsersRound, X,
 } from 'lucide-react';
 
 const CHAT_WALLPAPER_KEY = 'farazchat-chat-wallpaper';
@@ -1299,8 +1299,18 @@ function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [selectedWaveform, setSelectedWaveform] = useState([]);
   const [isRecording, setIsRecording] = useState(false);
+  const [recordingPaused, setRecordingPaused] = useState(false);
   const [startingRecording, setStartingRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
+  useEffect(() => {
+    if (!isRecording) {
+      setRecordingSeconds(0);
+      return undefined;
+    }
+    if (recordingPaused) return undefined;
+    const timer = setInterval(() => setRecordingSeconds((seconds) => seconds + 1), 1000);
+    return () => clearInterval(timer);
+  }, [isRecording, recordingPaused]);
   const [recordingWaveform, setRecordingWaveform] = useState(() => compactWaveform([]));
   const [cancelVoiceSwipe, setCancelVoiceSwipe] = useState(false);
   const [sendingMessage, setSendingMessage] = useState(false);
@@ -1605,125 +1615,135 @@ function App() {
   }
 
   async function startVoiceRecording() {
-    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
-      setError('Voice recording is not supported by this browser.');
-      return;
-    }
-    setStartingRecording(true);
-    setError('');
-    let stream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mimeType = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg;codecs=opus']
-        .find((type) => MediaRecorder.isTypeSupported?.(type));
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      recordingChunksRef.current = [];
-      recordingSizeRef.current = 0;
-      recordingSamplesRef.current = [];
-      setRecordingWaveform(compactWaveform([]));
-      cancelRecordingRef.current = false;
-      mediaStreamRef.current = stream;
-      recorderRef.current = recorder;
-      try {
-        const AudioContextType = window.AudioContext || window.webkitAudioContext;
-        if (AudioContextType) {
-          const audioContext = new AudioContextType();
-          waveformContextRef.current = audioContext;
-          await audioContext.resume();
-          const analyser = audioContext.createAnalyser();
-          analyser.fftSize = 256;
-          audioContext.createMediaStreamSource(stream).connect(analyser);
-          waveformAnalyserRef.current = analyser;
-          const sampleBuffer = new Uint8Array(analyser.fftSize);
-          waveformTimerRef.current = setInterval(() => {
-            analyser.getByteTimeDomainData(sampleBuffer);
-            let peak = 0;
-            for (const sample of sampleBuffer) peak = Math.max(peak, Math.abs(sample - 128) / 128);
-            recordingSamplesRef.current.push(Math.min(1, peak * 3));
-            setRecordingWaveform(compactWaveform(recordingSamplesRef.current));
-          }, 100);
-        }
-      } catch {
-        waveformContextRef.current?.close().catch(() => {});
-        waveformContextRef.current = null;
-        waveformAnalyserRef.current = null;
-      }
-      recorder.ondataavailable = (event) => {
-        if (!event.data.size) return;
-        recordingSizeRef.current += event.data.size;
-        if (recordingSizeRef.current > 15 * 1024 * 1024) {
-          cancelRecordingRef.current = true;
-          sendVoiceOnStopRef.current = false;
-          setError('Voice notes must be 15 MB or smaller.');
-          setIsRecording(false);
-          if (recorder.state !== 'inactive') recorder.stop();
-          return;
-        }
-        recordingChunksRef.current.push(event.data);
-      };
-      recorder.onerror = () => {
-        cancelRecordingRef.current = true;
-        setError('Voice recording stopped unexpectedly. Please try again.');
-        setIsRecording(false);
-      };
-      recorder.onstop = () => {
-        clearInterval(waveformTimerRef.current);
-        waveformTimerRef.current = null;
-        waveformAnalyserRef.current = null;
-        waveformContextRef.current?.close().catch(() => {});
-        waveformContextRef.current = null;
-        stream.getTracks().forEach((track) => track.stop());
-        mediaStreamRef.current = null;
-        recorderRef.current = null;
-        recordingPointerRef.current = null;
-        setCancelVoiceSwipe(false);
-        setIsRecording(false);
-        if (cancelRecordingRef.current) {
-          cancelRecordingRef.current = false;
-          recordingChunksRef.current = [];
-          recordingSamplesRef.current = [];
-          setRecordingWaveform(compactWaveform([]));
-          return;
-        }
-        const type = recorder.mimeType || recordingChunksRef.current[0]?.type || 'audio/webm';
-        const blob = new Blob(recordingChunksRef.current, { type });
-        recordingChunksRef.current = [];
-        if (!blob.size) {
-          setError('No audio was recorded. Try recording again.');
-          return;
-        }
-        const extension = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm';
-        const voiceNote = new File([blob], `voice-note-${Date.now()}.${extension}`, { type });
-        const waveform = compactWaveform(recordingSamplesRef.current);
-        recordingSamplesRef.current = [];
-        setError('');
-        if (sendVoiceOnStopRef.current) {
-          sendVoiceOnStopRef.current = false;
-          sendMessageContent('', voiceNote, waveform);
-        } else {
-          setSelectedFile(voiceNote);
-          setSelectedWaveform(waveform);
-        }
-      };
-      recorder.start(1000);
-      setIsRecording(true);
-      if (recordingPointerRef.current?.released) {
-        const pointerState = recordingPointerRef.current;
-        recordingPointerRef.current = null;
-        cancelRecordingRef.current = pointerState.cancelled;
-        sendVoiceOnStopRef.current = !pointerState.cancelled;
-        recorder.stop();
-      }
-    } catch (recordingError) {
-      stream?.getTracks().forEach((track) => track.stop());
-      recordingPointerRef.current = null;
-      setError(recordingError.name === 'NotAllowedError' || recordingError.name === 'PermissionDeniedError'
-        ? 'Allow microphone access to record a voice note.'
-        : 'Could not start voice recording. Check your microphone and try again.');
-    } finally {
-      setStartingRecording(false);
-    }
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+    setError('Voice recording is not supported by this browser.');
+    return;
   }
+  setStartingRecording(true);
+  setError('');
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mimeType = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg;codecs=opus']
+      .find((type) => MediaRecorder.isTypeSupported?.(type));
+    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+    recordingChunksRef.current = [];
+    recordingSizeRef.current = 0;
+    recordingSamplesRef.current = [];
+    setRecordingWaveform(compactWaveform([]));
+    cancelRecordingRef.current = false;
+    mediaStreamRef.current = stream;
+    recorderRef.current = recorder;
+
+    try {
+      const AudioContextType = window.AudioContext || window.webkitAudioContext;
+      if (AudioContextType) {
+        const audioContext = new AudioContextType();
+        waveformContextRef.current = audioContext;
+        await audioContext.resume();
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 256;
+        audioContext.createMediaStreamSource(stream).connect(analyser);
+        waveformAnalyserRef.current = analyser;
+        const sampleBuffer = new Uint8Array(analyser.fftSize);
+        waveformTimerRef.current = setInterval(() => {
+          analyser.getByteTimeDomainData(sampleBuffer);
+          let peak = 0;
+          for (const sample of sampleBuffer) peak = Math.max(peak, Math.abs(sample - 128) / 128);
+          recordingSamplesRef.current.push(Math.min(1, peak * 3));
+          setRecordingWaveform(compactWaveform(recordingSamplesRef.current));
+        }, 100);
+      }
+    } catch {
+      waveformContextRef.current?.close().catch(() => {});
+      waveformContextRef.current = null;
+      waveformAnalyserRef.current = null;
+    }
+
+    recorder.ondataavailable = (event) => {
+      if (!event.data.size) return;
+      recordingSizeRef.current += event.data.size;
+      if (recordingSizeRef.current > 15 * 1024 * 1024) {
+        cancelRecordingRef.current = true;
+        sendVoiceOnStopRef.current = false;
+        setError('Voice notes must be 15 MB or smaller.');
+        setIsRecording(false);
+        if (recorder.state !== 'inactive') recorder.stop();
+        return;
+      }
+      recordingChunksRef.current.push(event.data);
+    };
+
+    recorder.onerror = () => {
+      cancelRecordingRef.current = true;
+      setError('Voice recording stopped unexpectedly. Please try again.');
+      setIsRecording(false);
+    };
+
+    recorder.onstop = () => {
+      clearInterval(waveformTimerRef.current);
+      waveformTimerRef.current = null;
+      waveformAnalyserRef.current = null;
+      waveformContextRef.current?.close().catch(() => {});
+      waveformContextRef.current = null;
+      stream.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+      recorderRef.current = null;
+      recordingPointerRef.current = null;
+      setCancelVoiceSwipe(false);
+      setIsRecording(false);
+      setRecordingPaused(false);
+      setRecordingSeconds(0);
+      if (cancelRecordingRef.current) {
+        cancelRecordingRef.current = false;
+        recordingChunksRef.current = [];
+        recordingSamplesRef.current = [];
+        setRecordingWaveform(compactWaveform([]));
+        return;
+      }
+      const type = recorder.mimeType || recordingChunksRef.current[0]?.type || 'audio/webm';
+      const blob = new Blob(recordingChunksRef.current, { type });
+      recordingChunksRef.current = [];
+      if (!blob.size) {
+        setError('No audio was recorded. Try recording again.');
+        return;
+      }
+      const extension = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm';
+      const voiceNote = new File([blob], `voice-note-${Date.now()}.${extension}`, { type });
+      const waveform = compactWaveform(recordingSamplesRef.current);
+      recordingSamplesRef.current = [];
+      setError('');
+      if (sendVoiceOnStopRef.current) {
+        sendVoiceOnStopRef.current = false;
+        sendMessageContent('', voiceNote, waveform);
+      } else {
+        setSelectedFile(voiceNote);
+        setSelectedWaveform(waveform);
+      }
+    };
+
+    recorder.start(1000);
+    setIsRecording(true);
+    setRecordingPaused(false);
+    setRecordingSeconds(0);
+
+    if (recordingPointerRef.current?.released) {
+      const pointerState = recordingPointerRef.current;
+      recordingPointerRef.current = null;
+      cancelRecordingRef.current = pointerState.cancelled;
+      sendVoiceOnStopRef.current = !pointerState.cancelled;
+      recorder.stop();
+    }
+  } catch (recordingError) {
+    stream?.getTracks().forEach((track) => track.stop());
+    recordingPointerRef.current = null;
+    setError(recordingError.name === 'NotAllowedError' || recordingError.name === 'PermissionDeniedError'
+      ? 'Allow microphone access to record a voice note.'
+      : 'Could not start voice recording. Check your microphone and try again.');
+  } finally {
+    setStartingRecording(false);
+  }
+}
 
   function stopVoiceRecording(discard = false, send = false) {
     const recorder = recorderRef.current;
@@ -1733,6 +1753,18 @@ function App() {
     if (discard) setError('');
     recorder.stop();
     setIsRecording(false);
+  }
+
+  function toggleVoicePause() {
+    const recorder = recorderRef.current;
+    if (!recorder || recorder.state === 'inactive') return;
+    if (recorder.state === 'paused') {
+      recorder.resume();
+      setRecordingPaused(false);
+    } else if (recorder.state === 'recording') {
+      recorder.pause();
+      setRecordingPaused(true);
+    }
   }
 
   function beginVoicePress(event) {
@@ -1765,8 +1797,8 @@ function App() {
     setIsRecording(false);
   }
 
-  async function sendMessageContent(body) {
-    if (!body || !active || sendingMessage) return;
+  async function sendMessageContent(body, voiceFile = null, waveform = []) {
+    if ((!body && !voiceFile) || !active || sendingMessage) return;
     if (!canSendToActive) {
       setError(user.blocked_user_ids?.includes(active.id) || active.blocked_user_ids?.includes(user.id)
         ? 'Direct messages are blocked.'
@@ -1786,11 +1818,15 @@ function App() {
           senderId: replyingTo.senderId || replyingTo.sender_id,
           senderDisplayName: replyingTo.senderDisplayName || replyingTo.sender_display_name || replyingTo.sender_username,
         } : null;
-        await sendTextMessage({ chat: active, sender: user, body, replyTo });
+        if (voiceFile) {
+          await sendVoiceNoteMessage({ chat: active, sender: user, file: voiceFile, waveform });
+        } else {
+          await sendTextMessage({ chat: active, sender: user, body, replyTo });
+        }
         setReplyingTo(null);
       }
     } catch (sendError) {
-      setDraft(body);
+      if (body) setDraft(body);
       setError(sendError.message);
     } finally {
       setSendingMessage(false);
@@ -1904,11 +1940,12 @@ function App() {
           counts[emoji].mine ||= reactorId === user.id;
           return counts;
         }, {});
-        return <div className={`message-row${mine ? ' message-mine' : ''}${showAuthor ? ' message-first' : ''}`} data-message-id={message.id} key={message.id}>
+        return <div className={`message-row${mine ? ' message-mine' : ''}${showAuthor ? ' message-first' : ''}${message.voiceNoteUrl ? ' message-has-voice' : ''}`} data-message-id={message.id} key={message.id}>
           {active.kind === 'group' && !mine && <span className="message-group-avatar"><Avatar name={senderName} src={senderProfile?.avatar_url || ''} /></span>}
           <div className="message-stack">
             {active.kind === 'group' && showAuthor && !mine && <span className="group-message-author">{senderName}</span>}
             <div className="message-content-frame">
+              {message.voiceNoteUrl && <VoiceNotePlayer src={message.voiceNoteUrl} waveform={message.voiceNoteWaveform || []} />}
               {message.body && <div className="message-bubble">
                 {message.forwardedFrom && <span className="message-forwarded-label"><Forward size={12} /> Forwarded from {message.forwardedFrom.senderName || 'a member'}</span>}
                 {message.replyTo && <span className="message-reply-quote"><strong>{message.replyTo.senderDisplayName || 'Message'}</strong><span>{message.replyTo.body}</span></span>}
@@ -1963,15 +2000,20 @@ function App() {
   </div>
 )}
 {isRecording && (
-  <div className="voice-recording-indicator">
+  <div className={`voice-recording-indicator${cancelVoiceSwipe ? ' voice-cancel-pending' : ''}`}>
     <span className="recording-dot" />
-    <span>Recording… {recordingSeconds}s</span>
+    <span className="recording-timer">{formatAudioTime(recordingSeconds)}</span>
     <div className="recording-waveform">
       {recordingWaveform.slice(-40).map((amplitude, index) => (
         <i key={index} style={{ height: `${Math.round(20 + amplitude * 80)}%` }} />
       ))}
     </div>
-    <span className="recording-hint">Release to send · slide left to cancel</span>
+    <span className="recording-hint">{cancelVoiceSwipe ? 'Release to cancel' : 'Slide to cancel'}</span>
+    <div className="voice-recording-actions">
+      <button type="button" onClick={() => stopVoiceRecording(true)} aria-label="Discard voice note" title="Discard"><Trash2 size={17} /></button>
+      <button type="button" onClick={toggleVoicePause} aria-label={recordingPaused ? 'Resume recording' : 'Pause recording'} title={recordingPaused ? 'Resume' : 'Pause'}>{recordingPaused ? <Play size={16} /> : <Pause size={16} />}</button>
+      <button type="button" className="voice-send-button" onClick={() => stopVoiceRecording(false, true)} aria-label="Send voice note" title="Send"><Send size={15} /></button>
+    </div>
   </div>
 )}
 {selectedFile && (

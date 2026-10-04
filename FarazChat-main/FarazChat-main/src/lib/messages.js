@@ -1,4 +1,5 @@
 import { addDoc, collection, doc, onSnapshot, query, runTransaction, serverTimestamp, setDoc, updateDoc, where, writeBatch } from 'firebase/firestore';
+import { deleteObject, getDownloadURL, getStorage, ref, uploadBytes } from 'firebase/storage';
 import { db } from '../firebase';
 
 export function directConversationId(firstId, secondId) {
@@ -191,5 +192,64 @@ export async function toggleMessageReaction(messageId, userId, emoji) {
   } catch (error) {
     console.error('Message reaction error:', error);
     throw new Error(error.message || 'Could not update this reaction.');
+  }
+}
+
+export async function sendVoiceNoteMessage({ chat, sender, file, waveform = [] }) {
+  if (!file || !file.type.startsWith('audio/')) throw new Error('Choose a valid voice note.');
+  if (file.size > 15 * 1024 * 1024) throw new Error('Voice notes must be 15 MB or smaller.');
+
+  const messageReference = doc(collection(db, 'messages'));
+  const extension = file.type.includes('mp4') ? 'm4a' : file.type.includes('ogg') ? 'ogg' : 'webm';
+  const audioReference = ref(getStorage(), `voiceNotes/${sender.id}/${messageReference.id}`);
+  let uploaded = false;
+  try {
+    await uploadBytes(audioReference, file, {
+      contentType: file.type,
+      customMetadata: { messageId: messageReference.id },
+    });
+    uploaded = true;
+    const voiceNoteUrl = await getDownloadURL(audioReference);
+    const payload = {
+      senderId: sender.id,
+      senderDisplayName: sender.displayName || sender.display_name || '',
+      senderContactCode: sender.contactCode || sender.contact_code || '',
+      body: '',
+      voiceNoteUrl,
+      voiceNoteWaveform: waveform,
+      read: false,
+      createdAt: serverTimestamp(),
+    };
+
+    if (chat.kind === 'group') {
+      payload.groupId = chat.id;
+      payload.participants = chat.memberIds || chat.members?.map((member) => member.id) || [sender.id];
+    } else {
+      payload.conversationId = directConversationId(sender.id, chat.id);
+      payload.recipientId = chat.id;
+      payload.participants = [sender.id, chat.id];
+    }
+    await setDoc(messageReference, payload);
+
+    try {
+      if (chat.kind === 'group') {
+        await updateDoc(doc(db, 'groups', chat.id), { lastMessage: 'Voice note', lastMessageAt: serverTimestamp() });
+      } else {
+        await setDoc(doc(db, 'conversations', directConversationId(sender.id, chat.id)), {
+          participants: [sender.id, chat.id].sort(),
+          lastMessage: 'Voice note',
+          lastMessageAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        }, { merge: true });
+      }
+    } catch (summaryError) {
+      console.warn('Voice note saved, but its conversation summary could not be updated:', summaryError);
+    }
+
+    return { id: messageReference.id, ...payload, created_at: new Date().toISOString(), sender_id: sender.id, group_id: payload.groupId || null };
+  } catch (error) {
+    if (uploaded) await deleteObject(audioReference).catch(() => {});
+    console.error('Voice note send error:', error);
+    throw new Error(error.message || 'Could not send this voice note.');
   }
 }

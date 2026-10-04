@@ -1,0 +1,23 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /voiceNotes/{senderId}/{messageId} {
+      function messagePath() {
+        return /databases/(default)/documents/messages/$(messageId);
+      }
+
+      allow create: if request.auth != null
+        && request.auth.uid == senderId
+        && request.resource.size <= 15 * 1024 * 1024
+        && request.resource.contentType.matches('audio/(webm|mp4|ogg)(;.*)?')
+        && request.resource.metadata.messageId == messageId;
+
+      allow read: if request.auth != null
+        && (request.auth.uid == senderId
+          || (firestore.exists(messagePath())
+            && request.auth.uid in firestore.get(messagePath()).data.participants));
+
+      allow delete: if request.auth != null && request.auth.uid == senderId;
+    }
+  }
+}
