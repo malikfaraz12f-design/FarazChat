@@ -18,6 +18,12 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
       - name: Install dependencies
         run: cd FarazChat-main/FarazChat-main && npm install
 
@@ -26,12 +32,6 @@ jobs:
 
       - name: Sync Capacitor
         run: cd FarazChat-main/FarazChat-main && npx cap sync android
-
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
 
       - name: Build APK
         run: |
