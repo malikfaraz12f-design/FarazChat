@@ -1,6 +1,16 @@
 import { addDoc, collection, doc, onSnapshot, query, runTransaction, serverTimestamp, setDoc, updateDoc, where, writeBatch } from 'firebase/firestore';
-import { deleteObject, getDownloadURL, getStorage, ref, uploadBytes } from 'firebase/storage';
 import { db } from '../firebase';
+
+const MAX_VOICE_NOTE_BASE64_LENGTH = 700_000;
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(',')[1] || '');
+    reader.onerror = () => reject(new Error('Could not read the voice note.'));
+    reader.readAsDataURL(file);
+  });
+}
 
 export function directConversationId(firstId, secondId) {
   try {
@@ -197,25 +207,20 @@ export async function toggleMessageReaction(messageId, userId, emoji) {
 
 export async function sendVoiceNoteMessage({ chat, sender, file, waveform = [] }) {
   if (!file || !file.type.startsWith('audio/')) throw new Error('Choose a valid voice note.');
-  if (file.size > 15 * 1024 * 1024) throw new Error('Voice notes must be 15 MB or smaller.');
-
-  const messageReference = doc(collection(db, 'messages'));
-  const extension = file.type.includes('mp4') ? 'm4a' : file.type.includes('ogg') ? 'ogg' : 'webm';
-  const audioReference = ref(getStorage(), `voiceNotes/${sender.id}/${messageReference.id}`);
-  let uploaded = false;
   try {
-    await uploadBytes(audioReference, file, {
-      contentType: file.type,
-      customMetadata: { messageId: messageReference.id },
-    });
-    uploaded = true;
-    const voiceNoteUrl = await getDownloadURL(audioReference);
+    const voiceNoteBase64 = await fileToBase64(file);
+    if (voiceNoteBase64.length > MAX_VOICE_NOTE_BASE64_LENGTH) {
+      throw new Error('Voice notes must be small enough to fit in Firestore (700 KB encoded).');
+    }
+
+    const messageReference = doc(collection(db, 'messages'));
     const payload = {
       senderId: sender.id,
       senderDisplayName: sender.displayName || sender.display_name || '',
       senderContactCode: sender.contactCode || sender.contact_code || '',
       body: '',
-      voiceNoteUrl,
+      voiceNoteBase64,
+      voiceNoteType: file.type || 'audio/webm',
       voiceNoteWaveform: waveform,
       read: false,
       createdAt: serverTimestamp(),
@@ -248,7 +253,6 @@ export async function sendVoiceNoteMessage({ chat, sender, file, waveform = [] }
 
     return { id: messageReference.id, ...payload, created_at: new Date().toISOString(), sender_id: sender.id, group_id: payload.groupId || null };
   } catch (error) {
-    if (uploaded) await deleteObject(audioReference).catch(() => {});
     console.error('Voice note send error:', error);
     throw new Error(error.message || 'Could not send this voice note.');
   }

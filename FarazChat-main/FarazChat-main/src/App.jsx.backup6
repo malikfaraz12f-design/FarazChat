@@ -1309,12 +1309,6 @@ function App() {
   const [mobileChat, setMobileChat] = useState(false);
   const [onlineUsers, setOnlineUsers] = useState(() => new Set());
   const statusNotifications = [];
-  const [touchStartX, setTouchStartX] = useState(0);
-  const [touchStartY, setTouchStartY] = useState(0);
-  const [swipedMessageId, setSwipedMessageId] = useState(null);
-  const [swipeOffset, setSwipeOffset] = useState(0);
-  const [selectedMessages, setSelectedMessages] = useState(new Set());
-  const [longPressTimer, setLongPressTimer] = useState(null);
   const socketReady = Boolean(user);
   const contactTyping = false;
   const typingName = '';
@@ -1747,46 +1741,6 @@ function App() {
       setIsRecording(false);
       if (recorder.state !== 'inactive') recorder.stop();
     };
-  function handleTouchStart(e, message) {
-    const touch = e.touches[0];
-    setTouchStartX(touch.clientX);
-    setTouchStartY(touch.clientY);
-    const timer = setTimeout(() => {
-      setMessageActionMenuId(message.id);
-      if (navigator.vibrate) navigator.vibrate(50);
-    }, 500);
-    setLongPressTimer(timer);
-  }
-  function handleTouchMove(e, message) {
-    const touch = e.touches[0];
-    const deltaX = touch.clientX - touchStartX;
-    const deltaY = Math.abs(touch.clientY - touchStartY);
-    if (Math.abs(deltaX) > 10 || deltaY > 10) {
-      clearTimeout(longPressTimer);
-      setLongPressTimer(null);
-    }
-    if (deltaX > 0 && deltaX < 100) {
-      setSwipeOffset(deltaX);
-      setSwipedMessageId(message.id);
-    }
-  }
-  function handleTouchEnd(e, message) {
-    clearTimeout(longPressTimer);
-    setLongPressTimer(null);
-    if (swipeOffset > 50) {
-      startReply(message);
-    }
-    setSwipeOffset(0);
-    setSwipedMessageId(null);
-  }
-  function toggleMessageSelection(message) {
-    setSelectedMessages((current) => {
-      const next = new Set(current);
-      if (next.has(message.id)) next.delete(message.id);
-      else next.add(message.id);
-      return next;
-    });
-  }
 
     recorder.onstop = () => {
       const shouldDiscard = cancelRecordingRef.current;
@@ -1937,6 +1891,7 @@ function App() {
       const audioUrl = URL.createObjectURL(new Blob([bytes], { type }));
       const extension = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm';
       const link = document.createElement('a');
+      link.href = audioUrl;
       link.download = `farazchat-voice-note-${Date.now()}.${extension}`;
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(audioUrl), 1000);
@@ -2057,21 +2012,15 @@ function App() {
         const previous = messages[index - 1];
         const showAuthor = !previous || previous.sender_id !== message.sender_id;
         const senderProfile = active.kind === 'group' ? groupMembersById.get(message.sender_id) : null;
+        const senderName = senderProfile?.display_name || senderProfile?.username || message.sender_display_name || message.sender_username;
         const reactions = Object.entries(message.reactionsByUser || {}).reduce((counts, [reactorId, emoji]) => {
           counts[emoji] ||= { count: 0, mine: false };
           counts[emoji].count += 1;
           counts[emoji].mine ||= reactorId === user.id;
           return counts;
         }, {});
-return <div
-  className={`message-row${mine ? ' message-mine' : ''}${showAuthor ? ' message-first' : ''}${message.voiceNoteBase64 ? ' message-has-voice' : ''}`}
-  data-message-id={message.id}
-  key={message.id}
-  onTouchStart={(e) => handleTouchStart(e, message)}
-  onTouchMove={(e) => handleTouchMove(e, message)}
-  onTouchEnd={(e) => handleTouchEnd(e, message)}
-  onClick={() => { if (selectedMessages.size > 0) toggleMessageSelection(message); }}
->
+        return <div className={`message-row${mine ? ' message-mine' : ''}${showAuthor ? ' message-first' : ''}${message.voiceNoteBase64 ? ' message-has-voice' : ''}`} data-message-id={message.id} key={message.id}>
+          {active.kind === 'group' && !mine && <span className="message-group-avatar"><Avatar name={senderName} src={senderProfile?.avatar_url || ''} /></span>}
           <div className="message-stack">
             {active.kind === 'group' && showAuthor && !mine && <span className="group-message-author">{senderName}</span>}
             <div className="message-content-frame">

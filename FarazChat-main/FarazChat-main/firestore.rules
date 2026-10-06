@@ -37,6 +37,21 @@ service cloud.firestore {
       );
       allow create: if signedIn()
         && request.resource.data.senderId == request.auth.uid
+        && (!('voiceNoteType' in request.resource.data)
+          || 'voiceNoteBase64' in request.resource.data)
+        && (!('voiceNoteBase64' in request.resource.data)
+          || (request.resource.data.voiceNoteBase64 is string
+            && request.resource.data.voiceNoteBase64.size() > 0
+            && request.resource.data.voiceNoteBase64.size() <= 700000
+            && request.resource.data.voiceNoteType in [
+              'audio/webm',
+              'audio/webm;codecs=opus',
+              'audio/mp4',
+              'audio/ogg',
+              'audio/ogg;codecs=opus'
+            ]
+            && request.resource.data.voiceNoteWaveform is list
+            && request.resource.data.voiceNoteWaveform.size() <= 48))
         && (
           ('groupId' in request.resource.data
             && request.resource.data.groupId is string
