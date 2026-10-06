@@ -9,10 +9,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
-    defaults:
-      run:
-        working-directory: FarazChat-main/FarazChat-main
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -23,13 +19,13 @@ jobs:
           node-version: '20'
 
       - name: Install dependencies
-        run: npm install
+        run: cd FarazChat-main/FarazChat-main && npm install
 
       - name: Build web app
-        run: npm run build
+        run: cd FarazChat-main/FarazChat-main && npm run build
 
       - name: Sync Capacitor
-        run: npx cap sync android
+        run: cd FarazChat-main/FarazChat-main && npx cap sync android
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -41,8 +37,8 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Build APK
-        working-directory: FarazChat-main/FarazChat-main/android
         run: |
+          cd FarazChat-main/FarazChat-main/android
           chmod +x gradlew
           ./gradlew assembleDebug
 
