@@ -9,6 +9,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        working-directory: FarazChat-main/FarazChat-main
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -19,15 +23,12 @@ jobs:
           node-version: '20'
 
       - name: Install dependencies
-        working-directory: FarazChat-main/FarazChat-main
         run: npm install
 
       - name: Build web app
-        working-directory: FarazChat-main/FarazChat-main
         run: npm run build
 
       - name: Sync Capacitor
-        working-directory: FarazChat-main/FarazChat-main
         run: npx cap sync android
 
       - name: Setup Java
