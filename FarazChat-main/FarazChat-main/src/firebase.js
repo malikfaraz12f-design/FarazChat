@@ -20,10 +20,3 @@ enableIndexedDbPersistence(db).catch((err) => {
     console.warn('Browser does not support persistence');
   }
 });
-// Messaging — lazy load — sirf zaroorat par
-export async function getMessagingInstance() {
-  const { getMessaging, isSupported } = await import('firebase/messaging');
-  const supported = await isSupported();
-  if (!supported) return null;
-  return getMessaging(app);
-}
