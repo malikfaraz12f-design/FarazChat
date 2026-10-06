@@ -30,7 +30,7 @@ import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   ArrowLeft, Bell, Camera, Check, CheckCheck, Copy, Download, Eye, FileText, Forward, Heart, ImagePlus, KeyRound, LockKeyhole,
-  LogOut, MessageCircle, Mic, Moon, MoreHorizontal, Paperclip, Pause, Pencil, Play, Plus, Reply, Search, Send, Settings,
+  EyeOff, LogOut, MessageCircle, Mic, Moon, MoreHorizontal, Paperclip, Pause, Pencil, Play, Plus, Reply, Search, Send, Settings,
   Shield, ShieldCheck, Smile, Trash2, UserRound, UsersRound, X,
 } from 'lucide-react';
 
@@ -278,6 +278,7 @@ function AuthScreen({ onLogin }) {
   const [photoFile, setPhotoFile] = useState(null);
   const [photoPreview, setPhotoPreview] = useState('');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [confirmPassword, setConfirmPassword] = useState('');
   const [policiesAccepted, setPoliciesAccepted] = useState(false);
   const [error, setError] = useState('');
@@ -447,7 +448,10 @@ function AuthScreen({ onLogin }) {
               <label htmlFor="login-password">Password</label>
               <div className="field-with-icon">
                 <LockKeyhole size={17} />
-                <input id="login-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" placeholder="Your password" required />
+                <input id="login-password" type={showPassword ? 'text' : 'password'} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" placeholder="Your password" required />
+              <button type="button" className="password-toggle" onClick={() => setShowPassword((v) => !v)} aria-label={showPassword ? 'Hide password' : 'Show password'}>
+                {showPassword ? <EyeOff size={17} /> : <Eye size={17} />}
+              </button>
               </div>
               {error && <p className="form-error" role="alert">{error}</p>}
               <button className="primary-button auth-submit" disabled={busy}>{busy ? 'Signing in…' : 'Log in'}<span>→</span></button>
@@ -484,7 +488,10 @@ function AuthScreen({ onLogin }) {
                 <label htmlFor="register-password">Password</label>
                 <div className="field-with-icon">
                   <LockKeyhole size={17} />
-                  <input id="register-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" placeholder="At least 8 characters" minLength={8} maxLength={72} required />
+                  <input id="register-password" type={showPassword ? 'text' : 'password'} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" placeholder="At least 8 characters" minLength={8} maxLength={72} required />
+                  <button type="button" className="password-toggle" onClick={() => setShowPassword((v) => !v)} aria-label={showPassword ? 'Hide password' : 'Show password'}>
+                    {showPassword ? <EyeOff size={17} /> : <Eye size={17} />}
+                  </button>
                 </div>
                 <label htmlFor="register-password-confirm">Confirm password</label>
                 <div className="field-with-icon">
@@ -1287,6 +1294,7 @@ function App() {
   const [statusUpdates, setStatusUpdates] = useState([]);
   const [active, setActive] = useState(null);
   const [messages, setMessages] = useState([]);
+  const [messagesLoading, setMessagesLoading] = useState(false);
   const [replyingTo, setReplyingTo] = useState(null);
   const [editingMessageId, setEditingMessageId] = useState(null);
   const [messageActionMenuId, setMessageActionMenuId] = useState(null);
@@ -2047,6 +2055,12 @@ function App() {
       <section className={`chat-panel${mobileChat ? ' chat-mobile-visible' : ''}`}>
   {active ? <>
     <header className="chat-header"><button className="icon-button back-button" onClick={() => setMobileChat(false)} aria-label="Back to messages"><ArrowLeft size={19} /></button><button className="contact-profile-trigger" onClick={() => active.kind === 'group' ? setGroupDetailsOpen(true) : setContactProfileOpen(true)}><span className={active.kind === 'group' ? 'group-avatar chat-group-avatar' : ''}>{active.kind === 'group' ? (active.avatar_url ? <Avatar name={active.name} src={active.avatar_url} /> : <UsersRound size={19} />) : <Avatar name={active.display_name || active.username} src={active.avatar_url} />}</span><span className="chat-contact"><strong>{active.display_name || active.name || active.username}{active.isDeveloper && <ShieldCheck size={14} className="developer-badge" title="Developer" />}</strong><span className={`contact-status${active.kind !== 'group' && onlineUsers.has(active.id) ? ' is-online' : ''}`}><i />{contactTyping ? <>{typingName && `${typingName} `}<span className="typing-dots" aria-hidden="true"><i /><i /><i /></span></> : active.kind === 'group' ? `${active.member_count || active.members?.length || 0} members` : <>{onlineUsers.has(active.id) ? 'Online' : 'Offline'} · #{active.contact_code || active.username}</>}</span></span></button><button className="icon-button activity-button chat-activity-button" onClick={openStatusActivity} aria-label="Status activity" title="Status activity"><Bell size={18} />{statusNotifications.some((notification) => !notification.read_at) && <i>{statusNotifications.filter((notification) => !notification.read_at).length}</i>}</button><button className="chat-own-account" onClick={() => openSettings('profile')} aria-label={`Signed in as ${user.display_name || user.username}, code ${user.contact_code || user.username}`} title={`Signed in as ${user.display_name || user.username} · #${user.contact_code || user.username}`}><Avatar name={user.display_name || user.username} src={user.avatar_url} /><span><strong>{user.display_name || user.username}</strong><small>#{user.contact_code || user.username}</small></span></button></header>
+    {messagesLoading && (
+      <div className="messages-loading">
+        <div className="loading-spinner" />
+        <span>Loading messages�</span>
+      </div>
+    )}
     <div ref={messageStageRef} className={`message-stage wallpaper-${customChatWallpaper ? 'custom' : wallpaperPreset}${customChatWallpaper ? ' has-custom-wallpaper' : ''}`} style={{ ...(customChatWallpaper ? { "--chat-wallpaper-image": `url("${chatWallpaper}")` } : {}), "--wallpaper-opacity": wallpaperOpacity }}>
       <div className="message-date"><span>YOUR CONVERSATION</span></div>
       {messages.length === 0 && <div className="first-message"><Avatar name={active.kind === 'group' ? active.name : active.display_name || active.username} src={active.avatar_url} large /><strong>{active.kind === 'group' ? active.name : `You and ${active.display_name || active.username}`}</strong><span>{active.kind === 'group' ? 'Your group conversation starts here.' : 'This is the beginning of your conversation.'}</span><span className="first-message-rule" /></div>}
